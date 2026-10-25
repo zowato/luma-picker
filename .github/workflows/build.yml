@@ -1,0 +1,54 @@
+name: Build
+
+# Tests every push. Pushing a tag like v1.0.0 also builds the Windows app and
+# attaches LumaPicker-v1.0.0-windows.zip to a GitHub Release.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the release
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Test
+        run: python -m pytest -q tests
+
+      - name: Build app
+        run: >
+          python -m PyInstaller --noconfirm --clean --windowed --onedir
+          --name "Luma Picker" --icon assets/icon.ico
+          --distpath dist --workpath build src/luma_picker.py
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Copy-Item LICENSE, THIRD_PARTY_NOTICES.md, README.md "dist/Luma Picker/"
+          $name = if ("${{ github.ref_type }}" -eq "tag") { "${{ github.ref_name }}" } else { "dev" }
+          Compress-Archive -Path "dist/Luma Picker" -DestinationPath "LumaPicker-$name-windows.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LumaPicker-windows
+          path: LumaPicker-*-windows.zip
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: LumaPicker-*-windows.zip
+          body_path: CHANGELOG.md
