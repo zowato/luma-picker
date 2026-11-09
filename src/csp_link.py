@@ -3,7 +3,7 @@
 
 Built from the public protocol notes of ok-picker-csp (docs/PROTOCOL.md) and
 clipremote (both MIT). The connection is unofficial and may change with any
-Clip Studio update; Luma falls back to the screen pick when it is not up.
+Clip Studio update. While it is not up, the panel shows a warning.
 """
 import base64
 import json

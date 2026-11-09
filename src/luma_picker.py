@@ -289,7 +289,7 @@ def _hsv_of(hx):
     return h * 360.0, s, v
 
 
-def surroundings(surface_hex, object_hex, shadow_hexes, shift=1.0):
+def surroundings(surface_hex, shadow_hexes, shift=1.0):
     """Suggestions for the area around an object.
 
     floor:  the object's cast shadow on the surface, from the dark contact
@@ -1118,7 +1118,7 @@ class LumaPicker(QWidget):
 
     def surroundings(self):
         L, a, b = self._base()
-        return surroundings(self.surface(), oklab_to_hex(L, a, b), self.shades(),
+        return surroundings(self.surface(), self.shades(),
                             float(self.settings.get("hue_shift_strength", 1.0)))
 
     # --------------------------------------------- copy / paste / eyedropper

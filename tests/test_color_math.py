@@ -64,7 +64,7 @@ def test_harmonies(name, offsets):
 
 def test_surroundings():
     shades = lp.shading_rows(*lp.hex_to_oklab("#a8783a"))
-    floor, bounce = lp.surroundings("#d6d6d6", "#a8783a", shades)
+    floor, bounce = lp.surroundings("#d6d6d6", shades)
     assert len(floor) == 4 and len(bounce) == 4
     # floor shadow gets lighter toward the soft edge
     vs = [_hsv(c)[2] for c in floor]
