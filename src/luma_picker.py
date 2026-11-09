@@ -572,23 +572,95 @@ def grey_matrix(weights):
 _mag = {}
 
 
+def _mag_setup():
+    """Load the Win32 calls for the grey overlay once."""
+    from ctypes import wintypes as w
+    V = ctypes.c_void_p
+    u, mag = ctypes.WinDLL("user32"), ctypes.WinDLL("Magnification")
+    u.CreateWindowExW.restype = V
+    u.CreateWindowExW.argtypes = (w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD, ctypes.c_int,
+                                  ctypes.c_int, ctypes.c_int, ctypes.c_int, V, V, V, V)
+    u.DefWindowProcW.restype = V
+    u.DefWindowProcW.argtypes = (V, w.UINT, V, V)
+    for f, a in (("DestroyWindow", (V,)), ("ShowWindow", (V, ctypes.c_int)),
+                 ("SetLayeredWindowAttributes", (V, w.DWORD, w.BYTE, w.DWORD)),
+                 ("SetWindowDisplayAffinity", (V, w.DWORD)),
+                 ("InvalidateRect", (V, V, w.BOOL)),
+                 ("SetWindowPos", (V, V, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, w.UINT))):
+        getattr(u, f).argtypes = a
+    for f, a in (("MagInitialize", ()), ("MagSetWindowSource", (V, w.RECT)),
+                 ("MagSetColorEffect", (V, V)), ("MagSetWindowTransform", (V, V)),
+                 ("MagSetWindowFilterList", (V, w.DWORD, ctypes.c_int, V))):
+        getattr(mag, f).argtypes = a
+        getattr(mag, f).restype = w.BOOL
+    if not mag.MagInitialize():
+        raise OSError("MagInitialize failed")
+    WNDPROC = ctypes.WINFUNCTYPE(V, V, w.UINT, V, V)
+
+    class WNDCLASSEXW(ctypes.Structure):
+        _fields_ = [("cbSize", w.UINT), ("style", w.UINT), ("lpfnWndProc", WNDPROC),
+                    ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                    ("hInstance", V), ("hIcon", V), ("hCursor", V), ("hbrBackground", V),
+                    ("lpszMenuName", w.LPCWSTR), ("lpszClassName", w.LPCWSTR), ("hIconSm", V)]
+    proc = WNDPROC(lambda h, m, wp, lp: u.DefWindowProcW(h, m, wp, lp))
+    wc = WNDCLASSEXW(cbSize=ctypes.sizeof(WNDCLASSEXW), lpfnWndProc=proc,
+                     lpszClassName="LumaGreyHost")
+    ctypes.windll.user32.RegisterClassExW(ctypes.byref(wc))
+    _mag.update(u=u, mag=mag, w=w, proc=proc)
+
+
 def set_screen_grey(on, weights=None):
-    """Whole desktop in greyscale (Windows Magnification API), or back to
-    normal. Screen pickers still read the real colors. False if unsupported."""
+    """Whole desktop in greyscale, or back to normal. A click-through grey copy
+    of the screen sits on top. It is hidden from screen capture, so Clip
+    Studio's picker and the eyedropper still read the real colors under it.
+    False if unsupported (needs Windows 10 2004 or newer)."""
     if not IS_WIN:
         return False
     try:
-        if "dll" not in _mag:
-            dll = ctypes.WinDLL("Magnification")
-            dll.MagInitialize.restype = ctypes.c_bool
-            dll.MagSetFullscreenColorEffect.restype = ctypes.c_bool
-            dll.MagSetFullscreenColorEffect.argtypes = (ctypes.c_void_p,)
-            if not dll.MagInitialize():
-                return False
-            _mag["dll"] = dll
-        m = grey_matrix(weights or LUMA_W) if on else np.eye(5, dtype=np.float32)
-        buf = (ctypes.c_float * 25)(*m.flatten().tolist())
-        return bool(_mag["dll"].MagSetFullscreenColorEffect(ctypes.byref(buf)))
+        if "u" not in _mag:
+            _mag_setup()
+        u, mag, w = _mag["u"], _mag["mag"], _mag["w"]
+        if _mag.get("host"):                       # drop the old overlay
+            _mag.pop("timer").stop()
+            u.DestroyWindow(_mag.pop("host"))
+        if not on:
+            return True
+        sm = ctypes.windll.user32.GetSystemMetrics
+        x, y, cw, ch = sm(76), sm(77), sm(78), sm(79)      # whole virtual desktop
+        host = u.CreateWindowExW(0x08 | 0x80000 | 0x20 | 0x80 | 0x08000000,
+                                 "LumaGreyHost", "", 0x80000000, x, y, cw, ch,
+                                 None, None, None, None)   # topmost layered click-through
+        if not host:
+            return False
+        u.SetLayeredWindowAttributes(host, 0, 255, 2)
+        # WDA_EXCLUDEFROMCAPTURE: pickers (and the magnifier itself) see through it
+        if not u.SetWindowDisplayAffinity(host, 0x11):
+            u.DestroyWindow(host)
+            return False
+        view = u.CreateWindowExW(0, "Magnifier", "", 0x40000000 | 0x10000000,
+                                 0, 0, cw, ch, host, None, None, None)
+        ident = (ctypes.c_float * 9)(1, 0, 0, 0, 1, 0, 0, 0, 1)
+        effect = (ctypes.c_float * 25)(*grey_matrix(weights or LUMA_W).flatten().tolist())
+        hw = ctypes.c_void_p(host)
+        if not (view and mag.MagSetWindowTransform(view, ident)
+                and mag.MagSetColorEffect(view, effect)):
+            u.DestroyWindow(host)
+            return False
+        mag.MagSetWindowFilterList(view, 0, 1, ctypes.byref(hw))
+        u.ShowWindow(host, 4)                      # SW_SHOWNOACTIVATE
+        src = w.RECT(x, y, x + cw, y + ch)
+
+        def tick():
+            mag.MagSetWindowSource(view, src)
+            u.InvalidateRect(view, None, True)
+            u.SetWindowPos(host, ctypes.c_void_p(-1), 0, 0, 0, 0, 0x13)  # stay on top
+        timer = QTimer()
+        timer.timeout.connect(tick)
+        timer.start(16)
+        _mag.update(host=host, timer=timer)
+        tick()
+        return True
     except (OSError, AttributeError):
         return False
 
@@ -1272,12 +1344,7 @@ class LumaPicker(QWidget):
 
     def start_eyedropper(self, target="main"):
         self.sample_target = target
-        if getattr(self, "screen_grey", False):
-            # grab the real colors, then the frozen screen goes grey again
-            set_screen_grey(False)
-            QTimer.singleShot(60, lambda: (self.sampler.start(), set_screen_grey(True)))
-        else:
-            self.sampler.start()
+        self.sampler.start()
 
     def _on_sampled(self, hx):
         if self.sample_target == "main":
@@ -1436,15 +1503,11 @@ class LumaPicker(QWidget):
             self._finish_apply(hx)
             return
         self.applying = True
-        # CSP samples what the screen shows: lift the grey effect during the pick
-        grey = getattr(self, "screen_grey", False)
-        if grey:
-            set_screen_grey(False)
         self._flash_on(hx)
         QApplication.processEvents()
         focus(self.target_hwnd)
         # give Windows a frame or two to actually put the dot on screen
-        QTimer.singleShot(int(self.settings.get("flash_ms", 35)) + (50 if grey else 0),
+        QTimer.singleShot(int(self.settings.get("flash_ms", 35)),
                           lambda: self._step_shortcut(hx))
 
     def _step_shortcut(self, hx):
@@ -1514,8 +1577,6 @@ class LumaPicker(QWidget):
         self.flash = None
         self.applying = False
         self.dot.hide()
-        if getattr(self, "screen_grey", False):
-            set_screen_grey(True)
         if IS_WIN and not self.on_top:
             set_topmost(int(self.winId()), False)
         self.applied_hex = hx
