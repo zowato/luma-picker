@@ -4,7 +4,8 @@
 
 - **Clip Studio luminance value mode**: click `L` next to the hex to switch to `Y`, which keeps the grey value Clip Studio shows with a grey Color-blend layer (field, bar and harmonies all follow it)
 - **Round wheel**: switch the field between Square and Round. The wheel shows the same single value, with hue as the angle
-- **Gamut masks**: analogous, complementary, split complementary and triad, with Rotate and Width. Masked hues are dimmed and can't be picked
+- **Gamut masks**: analogous, complementary, split complementary and triad, with Rotate and Width. Masked hues are dimmed and can't be picked. Loading a color outside the mask turns the mask onto it
+- **New square field**: blocks of color with hue left to right and pale (top) to strongest (bottom), all at one value. It replaces the old a/b plane view
 - Mouse wheel over the field or bar nudges the value 1% per notch and sends the color when you stop
 - Fix: the pick shortcut is only sent to Clip Studio (`pick_apps`). Before, picking while another app was in front sent it Ctrl+Alt+Shift+O, which could open a file dialog
 

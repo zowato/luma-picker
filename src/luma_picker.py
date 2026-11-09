@@ -56,6 +56,7 @@ DEFAULTS = {
     "value_mode": "perceptual",    # or "luminance" (Clip Studio's grey check)
     "luma_weights": [0.30, 0.59, 0.11],   # R, G, B weights of "luminance"
     "field_shape": "square",       # or "round": a hue wheel at the same value
+    "field_cells": 24,             # color blocks per side of the square field
     "mask": 0,                     # index into MASKS (0 = off)
     "mask_rotate": 0,              # degrees
     "mask_width": 60,              # degrees per allowed hue sector
@@ -341,21 +342,6 @@ def surroundings(surface_hex, object_hex, shadow_hexes, shift=1.0):
     return floor, bounce
 
 
-_fit_cache = {}
-
-
-def fit_for_L(L):
-    """Center and half-size of the view so the gamut slice fills the field."""
-    key = round(float(L), 3)
-    if key not in _fit_cache:
-        h = np.linspace(0, 2 * np.pi, 144, endpoint=False)
-        a, b = clamp_chroma(np.full_like(h, key), np.cos(h) * 0.5, np.sin(h) * 0.5)
-        cx, cy = (a.min() + a.max()) / 2, (b.min() + b.max()) / 2
-        half = max(a.max() - a.min(), b.max() - b.min()) / 2 * 1.14
-        _fit_cache[key] = (float(cx), float(cy), float(max(half, 0.02)))
-    return _fit_cache[key]
-
-
 def _to_qimage(rgb, opaque=None):  # rgb: H x W x 3 floats in sRGB 0..1
     h, w, _ = rgb.shape
     arr = np.empty((h, w, 4), dtype=np.uint8)
@@ -426,25 +412,6 @@ def luma_color(Y, a, b):
     return L_for_luma(Y, a, b), a, b
 
 
-_fit_luma_cache = {}
-
-
-def fit_for_luma(Y):
-    """Like fit_for_L, for the slice of colors with luminance Y."""
-    key = (round(float(Y), 3), LUMA_W)
-    if key not in _fit_luma_cache:
-        h = np.linspace(0, 2 * np.pi, 144, endpoint=False)
-        lo, hi = np.zeros_like(h), np.full_like(h, 0.5)
-        for _ in range(16):
-            mid = (lo + hi) / 2
-            a, b = np.cos(h) * mid, np.sin(h) * mid
-            ok = in_gamut(*oklab_to_linear(L_for_luma(key[0], a, b, 14), a, b))
-            lo, hi = np.where(ok, mid, lo), np.where(ok, hi, mid)
-        a, b = np.cos(h) * lo, np.sin(h) * lo
-        cx, cy = (a.min() + a.max()) / 2, (b.min() + b.max()) / 2
-        half = max(a.max() - a.min(), b.max() - b.min()) / 2 * 1.14
-        _fit_luma_cache[key] = (float(cx), float(cy), float(max(half, 0.02)))
-    return _fit_luma_cache[key]
 
 
 _cmax_cache = {}
@@ -513,27 +480,51 @@ def mask_snap(h_deg, centers, rotate, width):
     return best[1]
 
 
-def field_ab(n, value, luma, shape):
-    """OKLab a, b of every pixel of an n x n field, plus the drawable area."""
+def mask_rotation_for(h_deg, centers, rotate):
+    """Mask rotation that puts the nearest sector's middle on hue h_deg."""
+    d = min(((h_deg - c - rotate + 540.0) % 360.0 - 180.0 for c in centers), key=abs)
+    return (rotate + d) % 360.0
+
+
+# Square field: hue runs left -> right from this OKLCH hue (red), the share
+# of each hue's max chroma runs top (pale) -> bottom (strongest).
+SQUARE_HUE0 = 30.0
+
+
+def square_hue_share(fx, fy):
+    """Field fractions (0..1, top-left origin) -> (hue degrees, chroma share)."""
+    return (SQUARE_HUE0 + np.asarray(fx) * 360.0) % 360.0, np.asarray(fy)
+
+
+def field_ab(n, value, luma, shape, cells=24):
+    """OKLab a, b of every pixel of an n x n field, plus the drawable area.
+    The square field is made of cells x cells flat color blocks."""
     t = (np.arange(n) + 0.5) / n
     if shape == "round":
         # angle = hue, radius = share of the most chroma this hue can have
         x, y = np.meshgrid(t * 2 - 1, 1 - t * 2)
         r, h = np.hypot(x, y), np.degrees(np.arctan2(y, x)) % 360.0
         C = np.minimum(r, 1.0) * cmax_at(max_chroma(value, luma), h)
-        hr = np.radians(h)
-        return C * np.cos(hr), C * np.sin(hr), r <= 1.0
-    cx, cy, half = fit_for_luma(value) if luma else fit_for_L(value)
-    A, B = np.meshgrid(cx - half + t * 2 * half, cy + half - t * 2 * half)
-    return A, B, np.ones_like(A, dtype=bool)
+    else:
+        q = (np.floor(t * cells) + 0.5) / cells           # cell centers
+        h, s = square_hue_share(*np.meshgrid(q, q))
+        C, r = s * cmax_at(max_chroma(value, luma), h), np.zeros_like(s)
+    hr = np.radians(h)
+    return C * np.cos(hr), C * np.sin(hr), r <= 1.0
 
 
-def render_view(value, n, luma=False, shape="square", mask=None):
+def render_view(value, n, luma=False, shape="square", mask=None, cells=24):
     """The big field. value = OKLab L, or luminance if luma.
     mask = (centers, rotate, width) or None."""
-    A, B, inside = field_ab(n, value, luma, shape)
-    if luma:
-        # solving L per pixel is slow; L changes smoothly across the field,
+    A, B, inside = field_ab(n, value, luma, shape, cells)
+    if luma and shape != "round":
+        # flat cells: solve L once per cell and spread it over the cell
+        Lc = L_for_luma(value, *field_ab(cells, value, luma, shape, cells)[:2])
+        idx = np.minimum((np.arange(n) + 0.5) / n * cells, cells - 1).astype(int)
+        L = Lc[idx][:, idx]
+        grey = np.full(3, min(max(value, 0.0), 1.0))     # same luminance
+    elif luma:
+        # solving L per pixel is slow; L changes smoothly across the wheel,
         # so solve it on a coarse grid and interpolate (picks stay exact)
         m = max(n // 4, 24)
         Lc = L_for_luma(value, *field_ab(m, value, luma, shape)[:2])
@@ -1029,7 +1020,19 @@ class LumaPicker(QWidget):
     def set_hex(self, hx):
         self.L, self.a, self.b = hex_to_oklab(hx)
         self.Y = luma_of_hex(hx)
+        m = self.mask()
+        if m and np.hypot(self.a, self.b) >= MASK_GREY_C:
+            h = float(np.degrees(np.arctan2(self.b, self.a))) % 360.0
+            if not mask_allows(h, *m):      # turn the mask onto the new color
+                self.settings["mask_rotate"] = round(mask_rotation_for(h, m[0], m[1])) % 360
+                save_settings(self.settings)
         self.update()
+
+    def cells(self):
+        try:
+            return min(max(int(self.settings.get("field_cells", 24)), 4), 96)
+        except (TypeError, ValueError):
+            return 24
 
     def luma_mode(self):
         return self.settings.get("value_mode") == "luminance"
@@ -1055,9 +1058,6 @@ class LumaPicker(QWidget):
         save_settings(self.settings)
         self.Y = luma_of_hex(self.current_hex())   # same color, new ruler
         self.show_toast("Value: CSP luminance" if on else "Value: perceptual")
-
-    def _fit(self):
-        return fit_for_luma(self.Y) if self.luma_mode() else fit_for_L(self.L)
 
     def round_field(self):
         return self.settings.get("field_shape") == "round"
@@ -1217,10 +1217,11 @@ class LumaPicker(QWidget):
             hr = np.radians(h)
             return QPointF(FIELD.center().x() + 0.5 + r * np.cos(hr),
                            FIELD.center().y() + 0.5 - r * np.sin(hr))
-        cx, cy, half = self._fit()
-        x = FIELD.left() + (a - (cx - half)) / (2 * half) * FIELD.width()
-        y = FIELD.top() + ((cy + half) - b) / (2 * half) * FIELD.height()
-        return QPointF(x, y)
+        h = float(np.degrees(np.arctan2(b, a))) % 360.0
+        cm = float(cmax_at(max_chroma(self.value(), self.luma_mode()), h))
+        fx = ((h - SQUARE_HUE0) % 360.0) / 360.0
+        fy = min(float(np.hypot(a, b)) / max(cm, 1e-6), 1.0)
+        return QPointF(FIELD.left() + fx * FIELD.width(), FIELD.top() + fy * FIELD.height())
 
     def point_to_ab(self, p):
         if self.round_field():
@@ -1231,10 +1232,13 @@ class LumaPicker(QWidget):
             C = min(float(np.hypot(x, y)), 1.0) * float(
                 cmax_at(max_chroma(self.value(), self.luma_mode()), h))
             return C * np.cos(np.radians(h)), C * np.sin(np.radians(h))
-        cx, cy, half = self._fit()
-        fx = min(max((p.x() - FIELD.left()) / FIELD.width(), 0.0), 1.0)
-        fy = min(max((p.y() - FIELD.top()) / FIELD.height(), 0.0), 1.0)
-        return cx - half + fx * 2 * half, cy + half - fy * 2 * half
+        # the color of the cell under the pen, exactly as drawn
+        k = self.cells()
+        fx = min(max((p.x() - FIELD.left()) / FIELD.width(), 0.0), 0.9999)
+        fy = min(max((p.y() - FIELD.top()) / FIELD.height(), 0.0), 0.9999)
+        h, s = square_hue_share((np.floor(fx * k) + 0.5) / k, (np.floor(fy * k) + 0.5) / k)
+        C = float(s) * float(cmax_at(max_chroma(self.value(), self.luma_mode()), h))
+        return C * np.cos(np.radians(float(h))), C * np.sin(np.radians(float(h)))
 
     # ---------------------------------------------------------------- showing
     @staticmethod
@@ -1606,11 +1610,11 @@ class LumaPicker(QWidget):
         v = self.value()
         shape = "round" if self.round_field() else "square"
         mask = self.mask()
-        fk = (round(v, 3 if fast else 4), dpr, fast, luma, LUMA_W, shape, mask)
+        fk = (round(v, 3 if fast else 4), dpr, fast, luma, LUMA_W, shape, mask, self.cells())
         if fk != self._field_key:
             n = int(FIELD.width() * dpr)
             n = n // 2 if fast else n
-            img = render_view(v, n, luma, shape, mask)
+            img = render_view(v, n, luma, shape, mask, self.cells())
             if fast:
                 img = img.scaled(n, n, Qt.IgnoreAspectRatio, Qt.FastTransformation)
             img.setDevicePixelRatio(dpr)

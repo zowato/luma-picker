@@ -18,12 +18,10 @@ def test_hex_round_trip(hx):
 
 def test_field_is_one_lightness():
     L = 0.65
-    cx, cy, half = lp.fit_for_L(L)
-    t = np.linspace(-half, half, 60)
-    A, B = np.meshgrid(cx + t, cy + t)
+    A, B, _ = lp.field_ab(60, L, False, "square")
     r, g, b = lp.oklab_to_linear(L, A, B)
     ok = lp.in_gamut(r, g, b)
-    assert ok.mean() > 0.2
+    assert ok.mean() > 0.99                        # every cell is a real color
     Lr, _, _ = lp.linear_to_oklab(r[ok], g[ok], b[ok])
     assert np.allclose(Lr, L, atol=1e-3)
 
@@ -87,14 +85,27 @@ def _luma(hx):
 
 @pytest.mark.parametrize("Y", [0.15, 0.4, 0.64, 0.9])
 def test_luma_field_is_one_luminance(Y):
-    cx, cy, half = lp.fit_for_luma(Y)
-    t = np.linspace(-half, half, 40)
-    A, B = np.meshgrid(cx + t, cy + t)
+    A, B, _ = lp.field_ab(40, Y, True, "square")
     r, g, b = lp.oklab_to_linear(lp.L_for_luma(Y, A, B), A, B)
     ok = lp.in_gamut(r, g, b)
-    assert ok.mean() > 0.1
+    assert ok.mean() > 0.99
     s = lp.linear_to_srgb(np.stack([r[ok], g[ok], b[ok]]))
     assert np.allclose(lp.luma_of_srgb(*s), Y, atol=2e-3)
+
+
+def test_square_field_layout():
+    A, B, _ = lp.field_ab(48, 0.7, False, "square", cells=12)
+    C = np.hypot(A, B)
+    assert C[0].max() < C[-1].min()                # pale top, strong bottom
+    assert np.allclose(A[:4, :4], A[0, 0]) and np.allclose(B[:4, :4], B[0, 0])  # flat 4x4 cells
+    h = np.degrees(np.arctan2(B[-1], A[-1])) % 360
+    assert abs(h[0] - (lp.SQUARE_HUE0 + 15) % 360) < 1   # first cell center hue
+
+
+def test_mask_turns_to_color():
+    rot = lp.mask_rotation_for(100, (0, 120, 240), 0)
+    assert lp.mask_allows(100, (0, 120, 240), rot, 20)
+    assert rot == 340                               # nearest sector (120) moved -20°
 
 
 def test_luma_color_hits_target_and_fits_gamut():
