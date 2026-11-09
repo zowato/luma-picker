@@ -17,6 +17,13 @@ of an object's surroundings. Colors go straight into **Clip Studio Paint**.
   it to switch to `Y`, Clip Studio luminance: the grey you see when you check
   values with a grey layer in **Color** blend mode. Use `Y` if you check your
   values that way in Clip Studio.
+- **Square or round.** Switch the field between the square view and a hue
+  wheel. Both show colors of one value only. On the wheel, the angle is the hue
+  and the edge is the most saturated color that hue can have at this value.
+- **Gamut masks** (analogous, complementary, split complementary, triad) limit
+  you to a few hue sectors that you can rotate and widen. Masked hues stay
+  visible but dimmed. If you drag into one, the pick slides to the nearest
+  allowed hue.
 - **Mouse wheel** over the field or the bar nudges the value 1% per notch. The
   color goes to Clip Studio once you stop scrolling.
 - **Shading** suggests 3 shadows and 3 lights for your color. Shadows get
@@ -71,6 +78,8 @@ changes to match.
 | Click or drag in the field, lift the pen | Send that color to Clip Studio |
 | Drag the bar under the field | Change lightness |
 | Mouse wheel over the field or bar | Nudge the value 1% per notch |
+| **Square / Round** (under the bar) | Switch the field between the square view and a hue wheel |
+| **‹ mask ›**, Rotate, Width | Pick a gamut mask, turn it and set how wide each sector is |
 | Click **L / Y** next to the hex | Switch between perceptual and Clip Studio luminance value |
 | Click a recent, shading or harmony swatch | Send that color |
 | **Jump on/off** (Shading) | On: the wheel moves to the shade you picked. Off: the rows stay put |
@@ -97,6 +106,8 @@ needed.
 | `apply_mode` | `screen_pick` | `clipboard` only copies the hex instead of sending it to Clip Studio |
 | `hue_shift_strength` | `1.0` | How strongly shading shifts hue (0.5 subtle, 2 strong) |
 | `pick_apps` | `["CLIPStudioPaint.exe"]` | Programs that get the pick shortcut. In any other program Luma copies the hex instead. Add another painting app's .exe name, or use `[]` to send everywhere |
+| `field_shape` | `square` | `round` shows the hue wheel |
+| `mask` / `mask_rotate` / `mask_width` | `0` / `0` / `60` | Gamut mask (0 off, 1 analogous, 2 complementary, 3 split, 4 triad), its turn and sector width in degrees |
 | `value_mode` | `perceptual` | `luminance` keeps Clip Studio's grey-layer value instead of OKLab lightness |
 | `luma_weights` | `[0.30, 0.59, 0.11]` | R, G, B weights for `luminance`. Adjust if Clip Studio's grey check disagrees |
 | `wheel_step` / `wheel_send_ms` | `0.01` / `350` | Value change per wheel notch / pause before the color is sent |

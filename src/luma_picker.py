@@ -55,6 +55,10 @@ DEFAULTS = {
     "hue_shift_strength": 1.0,     # 0.5 = subtle, 2 = strong hue shifting
     "value_mode": "perceptual",    # or "luminance" (Clip Studio's grey check)
     "luma_weights": [0.30, 0.59, 0.11],   # R, G, B weights of "luminance"
+    "field_shape": "square",       # or "round": a hue wheel at the same value
+    "mask": 0,                     # index into MASKS (0 = off)
+    "mask_rotate": 0,              # degrees
+    "mask_width": 60,              # degrees per allowed hue sector
     "wheel_step": 0.01,            # mouse wheel over field/bar: value per notch
     "wheel_send_ms": 350,          # send to CSP this long after the last notch
     "right_click_to_exit_pick": True,
@@ -352,24 +356,12 @@ def fit_for_L(L):
     return _fit_cache[key]
 
 
-def _to_qimage(rgb):  # rgb: H x W x 3 floats in sRGB 0..1
+def _to_qimage(rgb, opaque=None):  # rgb: H x W x 3 floats in sRGB 0..1
     h, w, _ = rgb.shape
     arr = np.empty((h, w, 4), dtype=np.uint8)
     arr[..., :3] = np.clip(np.round(rgb * 255), 0, 255).astype(np.uint8)
-    arr[..., 3] = 255
+    arr[..., 3] = 255 if opaque is None else np.where(opaque, 255, 0)
     return QImage(arr.data, w, h, w * 4, QImage.Format_RGBA8888).copy()
-
-
-def render_field(L, n):
-    cx, cy, half = fit_for_L(L)
-    t = (np.arange(n) + 0.5) / n * 2 * half - half
-    A, B = np.meshgrid(cx + t, cy - t)
-    r, g, b = oklab_to_linear(L, A, B)
-    ok = in_gamut(r, g, b)
-    gr, gg, gb = oklab_to_linear(L, 0.0, 0.0)
-    rgb = np.stack([np.where(ok, r, gr), np.where(ok, g, gg),
-                    np.where(ok, b, gb)], axis=-1)
-    return _to_qimage(linear_to_srgb(rgb))
 
 
 def render_slider(a, b, w, h):
@@ -455,25 +447,114 @@ def fit_for_luma(Y):
     return _fit_luma_cache[key]
 
 
-def render_field_luma(Y, n):
-    cx, cy, half = fit_for_luma(Y)
-    t = (np.arange(n) + 0.5) / n * 2 * half - half
-    A, B = np.meshgrid(cx + t, cy - t)
-    # solving L per pixel is slow; L changes smoothly across the field, so
-    # solve it on a coarse grid and interpolate (picked colors stay exact)
-    m = max(n // 4, 24)
-    tc = (np.arange(m) + 0.5) / m * 2 * half - half
-    Lc = L_for_luma(Y, *np.meshgrid(cx + tc, cy - tc))
-    pos = np.clip((np.arange(n) + 0.5) / n * m - 0.5, 0, m - 1)
-    i0 = np.minimum(pos.astype(int), m - 2)
-    f = pos - i0
-    Lr = Lc[i0] * (1 - f)[:, None] + Lc[i0 + 1] * f[:, None]          # rows
-    L = Lr[:, i0] * (1 - f)[None, :] + Lr[:, i0 + 1] * f[None, :]     # cols
+_cmax_cache = {}
+
+
+def max_chroma(value, luma=False):
+    """Largest in-gamut OKLab chroma for each whole hue degree (0..359)
+    at this lightness (or luminance, if luma)."""
+    key = (round(float(value), 3), bool(luma), LUMA_W if luma else None)
+    if key not in _cmax_cache:
+        h = np.radians(np.arange(360.0))
+        c, s = np.cos(h), np.sin(h)
+        if luma:
+            lo, hi = np.zeros(360), np.full(360, 0.5)
+            for _ in range(16):
+                mid = (lo + hi) / 2
+                ok = in_gamut(*oklab_to_linear(L_for_luma(key[0], c * mid, s * mid, 14),
+                                               c * mid, s * mid))
+                lo, hi = np.where(ok, mid, lo), np.where(ok, hi, mid)
+            _cmax_cache[key] = lo
+        else:
+            a, b = clamp_chroma(np.full(360, key[0]), c * 0.5, s * 0.5)
+            _cmax_cache[key] = np.hypot(a, b)
+    return _cmax_cache[key]
+
+
+def cmax_at(table, h_deg):
+    """Max chroma at any hue (degrees), interpolated from max_chroma()."""
+    return np.interp(np.asarray(h_deg) % 360.0, np.arange(361.0), np.append(table, table[0]))
+
+
+# --------------------------------------------------------------- gamut masks
+# Hue sectors you may pick from (centers in degrees, before rotation).
+# Masked hues stay visible but dimmed, and picking snaps to the nearest
+# allowed hue. Near-greys are always allowed.
+MASKS = [
+    ("Mask off", ()),
+    ("Analogous", (0,)),
+    ("Complementary", (0, 180)),
+    ("Split compl.", (0, 150, 210)),
+    ("Triad", (0, 120, 240)),
+]
+MASK_GREY_C = 0.015   # chroma below this counts as grey (never masked)
+
+
+def _hue_dist(h, c):
+    return np.abs((np.asarray(h) - c + 540.0) % 360.0 - 180.0)
+
+
+def mask_allows(h_deg, centers, rotate, width):
+    if not centers:
+        return np.ones(np.shape(h_deg), dtype=bool)
+    return np.min([_hue_dist(h_deg, c + rotate) for c in centers], axis=0) <= width / 2
+
+
+def mask_snap(h_deg, centers, rotate, width):
+    """The allowed hue nearest to h_deg (h_deg itself if it is allowed)."""
+    if not centers or mask_allows(h_deg, centers, rotate, width):
+        return h_deg % 360.0
+    best = None
+    for c in centers:
+        for edge in (c + rotate - width / 2, c + rotate + width / 2):
+            d = float(_hue_dist(h_deg, edge))
+            if best is None or d < best[0]:
+                best = (d, edge % 360.0)
+    return best[1]
+
+
+def field_ab(n, value, luma, shape):
+    """OKLab a, b of every pixel of an n x n field, plus the drawable area."""
+    t = (np.arange(n) + 0.5) / n
+    if shape == "round":
+        # angle = hue, radius = share of the most chroma this hue can have
+        x, y = np.meshgrid(t * 2 - 1, 1 - t * 2)
+        r, h = np.hypot(x, y), np.degrees(np.arctan2(y, x)) % 360.0
+        C = np.minimum(r, 1.0) * cmax_at(max_chroma(value, luma), h)
+        hr = np.radians(h)
+        return C * np.cos(hr), C * np.sin(hr), r <= 1.0
+    cx, cy, half = fit_for_luma(value) if luma else fit_for_L(value)
+    A, B = np.meshgrid(cx - half + t * 2 * half, cy + half - t * 2 * half)
+    return A, B, np.ones_like(A, dtype=bool)
+
+
+def render_view(value, n, luma=False, shape="square", mask=None):
+    """The big field. value = OKLab L, or luminance if luma.
+    mask = (centers, rotate, width) or None."""
+    A, B, inside = field_ab(n, value, luma, shape)
+    if luma:
+        # solving L per pixel is slow; L changes smoothly across the field,
+        # so solve it on a coarse grid and interpolate (picks stay exact)
+        m = max(n // 4, 24)
+        Lc = L_for_luma(value, *field_ab(m, value, luma, shape)[:2])
+        pos = np.clip((np.arange(n) + 0.5) / n * m - 0.5, 0, m - 1)
+        i0 = np.minimum(pos.astype(int), m - 2)
+        f = pos - i0
+        Lr = Lc[i0] * (1 - f)[:, None] + Lc[i0 + 1] * f[:, None]          # rows
+        L = Lr[:, i0] * (1 - f)[None, :] + Lr[:, i0 + 1] * f[None, :]     # cols
+        grey = np.full(3, min(max(value, 0.0), 1.0))     # same luminance
+    else:
+        L = value
+        grey = linear_to_srgb(np.array(oklab_to_linear(value, 0.0, 0.0)))
     r, g, b = oklab_to_linear(L, A, B)
     ok = in_gamut(r, g, b)
     rgb = linear_to_srgb(np.stack([r, g, b], axis=-1))
-    rgb[~ok] = min(max(Y, 0.0), 1.0)      # grey of the same luminance
-    return _to_qimage(rgb)
+    rgb[~ok] = grey
+    if mask and mask[0]:
+        hue = np.degrees(np.arctan2(B, A)) % 360.0
+        off = ok & ~mask_allows(hue, *mask) & (np.hypot(A, B) >= MASK_GREY_C)
+        rgb[off] = grey + (rgb[off] - grey) * 0.22       # visible, but dull
+    return _to_qimage(rgb, inside)
 
 
 def render_slider_luma(a, b, w, h):
@@ -669,7 +750,17 @@ PAD = 12
 HEADER_H = 44                      # drag the window by this top bar
 FIELD = QRect(PAD, 46, W - 2 * PAD, W - 2 * PAD)
 SLIDER = QRect(PAD, FIELD.bottom() + 11, W - 2 * PAD, 24)
-HIST_Y = SLIDER.bottom() + 11
+VIEW_Y = SLIDER.bottom() + 10                     # Square|Round  ·  mask
+SHAPE_SQ = QRect(PAD, VIEW_Y, 50, 18)
+SHAPE_RD = QRect(SHAPE_SQ.right() + 1, VIEW_Y, 50, 18)
+MASK_PREV = QRect(W - PAD - 124, VIEW_Y, 18, 18)
+MASK_NEXT = QRect(W - PAD - 18, VIEW_Y, 18, 18)
+MASK_NAME = QRect(MASK_PREV.right() + 1, VIEW_Y,
+                  MASK_NEXT.left() - MASK_PREV.right() - 2, 18)
+MASK_SL_Y = VIEW_Y + 26                           # Rotate / Width sliders
+ROT_SL = QRect(PAD + 42, MASK_SL_Y, 82, 14)
+WID_SL = QRect(W - PAD - 82, MASK_SL_Y, 82, 14)
+HIST_Y = MASK_SL_Y + 14 + 12
 HIST_N = 8
 HIST_GAP = 6
 HIST_SIZE = (FIELD.width() - HIST_GAP * (HIST_N - 1)) // HIST_N
@@ -968,6 +1059,47 @@ class LumaPicker(QWidget):
     def _fit(self):
         return fit_for_luma(self.Y) if self.luma_mode() else fit_for_L(self.L)
 
+    def round_field(self):
+        return self.settings.get("field_shape") == "round"
+
+    def set_shape(self, shape):
+        self.settings["field_shape"] = shape
+        save_settings(self.settings)
+        self.update()
+
+    def mask_index(self):
+        try:
+            return int(self.settings.get("mask", 0)) % len(MASKS)
+        except (TypeError, ValueError):
+            return 0
+
+    def mask(self):
+        """(centers, rotate, width) of the gamut mask, or None when off."""
+        centers = MASKS[self.mask_index()][1]
+        if not centers:
+            return None
+        try:
+            rot = float(self.settings.get("mask_rotate", 0)) % 360.0
+            wid = min(max(float(self.settings.get("mask_width", 60)), 10.0), 180.0)
+        except (TypeError, ValueError):
+            rot, wid = 0.0, 60.0
+        return centers, rot, wid
+
+    def cycle_mask(self, step):
+        self.settings["mask"] = (self.mask_index() + step) % len(MASKS)
+        save_settings(self.settings)
+        self.update()
+
+    def _drag_mask(self, p):
+        if self.dragging == "rot":
+            f = (p.x() - ROT_SL.left()) / ROT_SL.width()
+            v = self.settings["mask_rotate"] = round(min(max(f, 0.0), 1.0) * 360) % 360
+            self.show_toast("Rotate %d°" % v, 700)
+        else:
+            f = (p.x() - WID_SL.left()) / WID_SL.width()
+            v = self.settings["mask_width"] = round(10 + min(max(f, 0.0), 1.0) * 170)
+            self.show_toast("Width %d°" % v, 700)
+
     def _base(self):
         """Color the shading/harmony rows are built from."""
         return self.shade_base if self.shade_base else (self.L, self.a, self.b)
@@ -1078,12 +1210,27 @@ class LumaPicker(QWidget):
 
     # --------------------------------------------------------------- geometry
     def ab_to_point(self, a, b):
+        if self.round_field():
+            h = float(np.degrees(np.arctan2(b, a))) % 360.0
+            cm = float(cmax_at(max_chroma(self.value(), self.luma_mode()), h))
+            r = min(float(np.hypot(a, b)) / max(cm, 1e-6), 1.0) * FIELD.width() / 2
+            hr = np.radians(h)
+            return QPointF(FIELD.center().x() + 0.5 + r * np.cos(hr),
+                           FIELD.center().y() + 0.5 - r * np.sin(hr))
         cx, cy, half = self._fit()
         x = FIELD.left() + (a - (cx - half)) / (2 * half) * FIELD.width()
         y = FIELD.top() + ((cy + half) - b) / (2 * half) * FIELD.height()
         return QPointF(x, y)
 
     def point_to_ab(self, p):
+        if self.round_field():
+            rad = FIELD.width() / 2
+            x = (p.x() - FIELD.center().x() - 0.5) / rad
+            y = (FIELD.center().y() + 0.5 - p.y()) / rad
+            h = float(np.degrees(np.arctan2(y, x))) % 360.0
+            C = min(float(np.hypot(x, y)), 1.0) * float(
+                cmax_at(max_chroma(self.value(), self.luma_mode()), h))
+            return C * np.cos(np.radians(h)), C * np.sin(np.radians(h))
         cx, cy, half = self._fit()
         fx = min(max((p.x() - FIELD.left()) / FIELD.width(), 0.0), 1.0)
         fy = min(max((p.y() - FIELD.top()) / FIELD.height(), 0.0), 1.0)
@@ -1297,6 +1444,16 @@ class LumaPicker(QWidget):
         elif SLIDER.adjusted(0, -4, 0, 4).contains(pt):
             self.dragging = "slider"
             self._drag_slider(p)
+        elif SHAPE_SQ.contains(pt) or SHAPE_RD.contains(pt):
+            self.set_shape("round" if SHAPE_RD.contains(pt) else "square")
+        elif MASK_PREV.contains(pt):
+            self.cycle_mask(-1)
+        elif MASK_NEXT.contains(pt) or MASK_NAME.contains(pt):
+            self.cycle_mask(1)
+        elif self.mask() and (ROT_SL.adjusted(-6, -4, 6, 4).contains(pt)
+                              or WID_SL.adjusted(-6, -4, 6, 4).contains(pt)):
+            self.dragging = "rot" if ROT_SL.adjusted(-6, -4, 6, 4).contains(pt) else "wid"
+            self._drag_mask(p)
         elif CLOSE_BTN.contains(pt):
             self.hide_popup()
         elif PIN_BTN.contains(pt):
@@ -1359,7 +1516,8 @@ class LumaPicker(QWidget):
             return
         pt = e.position().toPoint()
         over_btn = any(r.contains(pt) for r in (CLOSE_BTN, PIN_BTN, TOP_BTN, EYE_BTN, HEX_RECT,
-                                               MODE_BTN, OLD_SW, NEW_SW))
+                                               MODE_BTN, OLD_SW, NEW_SW, SHAPE_SQ, SHAPE_RD,
+                                               MASK_PREV, MASK_NAME, MASK_NEXT))
         want = (Qt.SizeAllCursor if pt.y() < HEADER_H and not over_btn
                 else Qt.PointingHandCursor if over_btn else Qt.ArrowCursor)
         if self.cursor().shape() != want:
@@ -1368,6 +1526,8 @@ class LumaPicker(QWidget):
             self._drag_field(e.position())
         elif self.dragging == "slider":
             self._drag_slider(e.position())
+        elif self.dragging in ("rot", "wid"):
+            self._drag_mask(e.position())
 
     def mouseReleaseEvent(self, e):
         if self.applying or e.button() != Qt.LeftButton:
@@ -1377,6 +1537,11 @@ class LumaPicker(QWidget):
             # a window you placed yourself stays there and stays open
             self.settings["window_pos"] = [self.x(), self.y()]
             self.set_pinned(True)
+            return
+        if self.dragging in ("rot", "wid"):
+            self.dragging = None
+            save_settings(self.settings)
+            self.update()
             return
         if self.dragging in ("field", "slider"):
             self.dragging = None
@@ -1397,6 +1562,11 @@ class LumaPicker(QWidget):
     def _drag_field(self, p):
         self.shade_base = None
         a, b = self.point_to_ab(p)
+        m = self.mask()
+        C = float(np.hypot(a, b))
+        if m and C >= MASK_GREY_C:      # masked hue: slide to the nearest allowed one
+            h = np.radians(mask_snap(float(np.degrees(np.arctan2(b, a))), *m))
+            a, b = C * np.cos(h), C * np.sin(h)
         if self.luma_mode():
             L, a, b = luma_color(self.Y, a, b)
             self.L = float(L)
@@ -1431,14 +1601,16 @@ class LumaPicker(QWidget):
         dpr = self.devicePixelRatioF()
         # half resolution while the lightness bar is being dragged: much
         # cheaper, and the full-quality field comes back on release
-        fast = self.dragging == "slider" or self.wheel_timer.isActive()
+        fast = self.dragging in ("slider", "rot", "wid") or self.wheel_timer.isActive()
         luma = self.luma_mode()
         v = self.value()
-        fk = (round(v, 3 if fast else 4), dpr, fast, luma, LUMA_W)
+        shape = "round" if self.round_field() else "square"
+        mask = self.mask()
+        fk = (round(v, 3 if fast else 4), dpr, fast, luma, LUMA_W, shape, mask)
         if fk != self._field_key:
             n = int(FIELD.width() * dpr)
             n = n // 2 if fast else n
-            img = render_field_luma(v, n) if luma else render_field(v, n)
+            img = render_view(v, n, luma, shape, mask)
             if fast:
                 img = img.scaled(n, n, Qt.IgnoreAspectRatio, Qt.FastTransformation)
             img.setDevicePixelRatio(dpr)
@@ -1536,6 +1708,10 @@ class LumaPicker(QWidget):
         p.setClipPath(fpath)
         p.drawImage(FIELD, field_img)
         p.restore()
+        if self.round_field():          # smooth the wheel's pixel edge
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(BG), 2.2))
+            p.drawEllipse(QRectF(FIELD).adjusted(-0.5, -0.5, 0.5, 0.5))
 
         ea, eb = self.effective_ab()
         pt = self.ab_to_point(ea, eb)
@@ -1558,6 +1734,48 @@ class LumaPicker(QWidget):
         p.setPen(QPen(QColor("#ffffff"), 1.6))
         p.setBrush(QColor(cur))
         p.drawRoundedRect(handle, 4, 4)
+
+        # ---- field shape switch + gamut mask
+        small8 = QFont("Segoe UI", 8)
+        p.setFont(small8)
+        rnd = self.round_field()
+        seg = QPainterPath()
+        seg.addRoundedRect(QRectF(SHAPE_SQ.united(SHAPE_RD)), 9, 9)
+        p.setPen(QPen(QColor("#3a3a46"), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(seg)
+        p.save()
+        p.setClipPath(seg)
+        p.fillRect(SHAPE_RD if rnd else SHAPE_SQ, QColor("#2e2a4a"))
+        p.restore()
+        for rect, label, on in ((SHAPE_SQ, "Square", not rnd), (SHAPE_RD, "Round", rnd)):
+            p.setPen(QColor(TEXT if on else DIM))
+            p.drawText(QRectF(rect), Qt.AlignCenter, label)
+
+        mask = self.mask()
+        p.setPen(QColor(DIM))
+        p.drawText(QRectF(MASK_PREV), Qt.AlignCenter, "‹")
+        p.drawText(QRectF(MASK_NEXT), Qt.AlignCenter, "›")
+        p.setPen(QColor(TEXT if mask else DIM))
+        p.drawText(QRectF(MASK_NAME), Qt.AlignCenter, MASKS[self.mask_index()][0])
+
+        rot = float(self.settings.get("mask_rotate", 0) or 0) % 360.0
+        wid = min(max(float(self.settings.get("mask_width", 60) or 60), 10.0), 180.0)
+        for rect, label, f in ((ROT_SL, "Rotate", rot / 360.0),
+                               (WID_SL, "Width", (wid - 10) / 170.0)):
+            p.setPen(QColor(DIM if not mask else TEXT))
+            p.drawText(QRect(rect.left() - 42, rect.top() - 2, 40, 18),
+                       Qt.AlignVCenter | Qt.AlignLeft, label)
+            y = rect.center().y() + 0.5
+            p.setPen(QPen(QColor("#3a3a46"), 3, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+            x = rect.left() + f * rect.width()
+            if mask:
+                p.setPen(QPen(QColor(BORDER), 3, Qt.SolidLine, Qt.RoundCap))
+                p.drawLine(QPointF(rect.left(), y), QPointF(x, y))
+            p.setPen(QPen(QColor("#000000a0"), 1))
+            p.setBrush(QColor(TEXT if mask else DIM))
+            p.drawEllipse(QPointF(x, y), 5, 5)
 
         for i in range(HIST_N):
             r = QRectF(hist_rect(i))

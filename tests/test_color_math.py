@@ -117,3 +117,29 @@ def test_harmony_keeps_luminance():
     Y = _luma("#c0607a")
     for hx, _h, _base in lp.harmony_colors(L, a, b, (0, 120, 240), luma=Y):
         assert abs(_luma(hx) - Y) < 0.01
+
+
+# ---- round wheel + gamut masks
+@pytest.mark.parametrize("luma", [False, True])
+def test_round_wheel_rim_is_in_gamut_and_one_value(luma):
+    v = 0.6
+    A, B, inside = lp.field_ab(60, v, luma, "round")
+    A, B = A[inside], B[inside]
+    L = lp.L_for_luma(v, A, B) if luma else np.full_like(A, v)
+    r, g, b = lp.oklab_to_linear(L, A, B)
+    assert lp.in_gamut(r, g, b).mean() > 0.99      # the whole disc is usable
+    if luma:
+        s = lp.linear_to_srgb(np.stack([r, g, b]))
+        assert np.allclose(lp.luma_of_srgb(*s), v, atol=2e-3)
+
+
+def test_mask_allows_and_snaps():
+    tri = (0, 120, 240)
+    assert lp.mask_allows(10, tri, 0, 40)
+    assert not lp.mask_allows(60, tri, 0, 40)
+    assert lp.mask_allows(70, tri, 60, 40)          # rotated
+    assert lp.mask_snap(30, tri, 0, 40) == 20       # nearest sector edge
+    assert lp.mask_snap(355, (0,), 0, 40) == 355    # allowed: unchanged
+    assert lp.mask_snap(160, (0,), 0, 40) == 20     # 140° to 20, 180° to 340
+    assert lp.mask_snap(200, (0,), 0, 40) == 340
+    assert lp.mask_allows(123, (), 0, 40)            # mask off
