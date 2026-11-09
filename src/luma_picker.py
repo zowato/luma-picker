@@ -49,7 +49,8 @@ DEFAULTS = {
     "hue_shift_strength": 1.0,     # 0.5 = subtle, 2 = strong hue shifting
     "value_mode": "perceptual",    # or "luminance" (Clip Studio's grey check)
     "luma_weights": [0.30, 0.59, 0.11],   # R, G, B weights of "luminance"
-    "field_shape": "square",       # or "round": a hue wheel at the same value
+    "field_shape": "square",       # "round": hue wheel, "focus": a/b plane slice
+    "focus_zoom": True,            # focus view: zoom to the slice, or show the full plane
     "field_cells": 24,             # color blocks per side of the square field
     "mask": 0,                     # index into MASKS (0 = off)
     "mask_rotate": 0,              # degrees
@@ -442,7 +443,7 @@ def cmax_at(table, h_deg):
 MASKS = [
     ("Mask off", ()),
     ("Analogous", (0,)),
-    ("Complementary", (0, 180)),
+    ("Complement", (0, 180)),
     ("Split compl.", (0, 150, 210)),
     ("Triad", (0, 120, 240)),
 ]
@@ -488,10 +489,30 @@ def square_hue_share(fx, fy):
     return (SQUARE_HUE0 + np.asarray(fx) * 360.0) % 360.0, np.asarray(fy)
 
 
+FULL_HALF = 0.34      # "full" plane view: a, b from -0.34 to 0.34 (all of sRGB)
+
+
+def plane_view(value, luma, shape):
+    """Center and half-size of the a/b plane view. "focus" zooms so the
+    slice of this value fills the field, "full" shows the whole plane."""
+    if shape != "focus":
+        return 0.0, 0.0, FULL_HALF
+    h = np.arange(0, 360, 2.5)
+    c = cmax_at(max_chroma(value, luma), h)
+    a, b = c * np.cos(np.radians(h)), c * np.sin(np.radians(h))
+    half = max(a.max() - a.min(), b.max() - b.min()) / 2 * 1.14
+    return float(a.max() + a.min()) / 2, float(b.max() + b.min()) / 2, float(max(half, 0.02))
+
+
 def field_ab(n, value, luma, shape, cells=24):
     """OKLab a, b of every pixel of an n x n field, plus the drawable area.
-    The square field is made of cells x cells flat color blocks."""
+    The square field is made of cells x cells flat color blocks; "focus" and
+    "full" are the plain a/b plane (out-of-gamut parts drawn grey)."""
     t = (np.arange(n) + 0.5) / n
+    if shape in ("focus", "full"):
+        cx, cy, half = plane_view(value, luma, shape)
+        A, B = np.meshgrid(cx + (t * 2 - 1) * half, cy - (t * 2 - 1) * half)
+        return A, B, np.ones_like(A, dtype=bool)
     if shape == "round":
         # angle = hue, radius = share of the most chroma this hue can have
         x, y = np.meshgrid(t * 2 - 1, 1 - t * 2)
@@ -509,14 +530,14 @@ def render_view(value, n, luma=False, shape="square", mask=None, cells=24):
     """The big field. value = OKLab L, or luminance if luma.
     mask = (centers, rotate, width) or None."""
     A, B, inside = field_ab(n, value, luma, shape, cells)
-    if luma and shape != "round":
+    if luma and shape == "square":
         # flat cells: solve L once per cell and spread it over the cell
         Lc = L_for_luma(value, *field_ab(cells, value, luma, shape, cells)[:2])
         idx = np.minimum((np.arange(n) + 0.5) / n * cells, cells - 1).astype(int)
         L = Lc[idx][:, idx]
         grey = np.full(3, min(max(value, 0.0), 1.0))     # same luminance
     elif luma:
-        # solving L per pixel is slow; L changes smoothly across the wheel,
+        # solving L per pixel is slow; L changes smoothly across the field,
         # so solve it on a coarse grid and interpolate (picks stay exact)
         m = max(n // 4, 24)
         Lc = L_for_luma(value, *field_ab(m, value, luma, shape)[:2])
@@ -750,13 +771,15 @@ HEADER_H = 44                      # drag the window by this top bar
 LINK_RECT = QRect(PAD, 44, W - 2 * PAD, 32)     # Clip Studio connection status
 LINK_BTN = QRect(W - PAD - 64, 45, 64, 16)
 FIELD = QRect(PAD, LINK_RECT.bottom() + 5, W - 2 * PAD, W - 2 * PAD)
+ZOOM_BTN = QRect(FIELD.right() - 50, FIELD.top() + 6, 44, 18)   # Focus/Full (focus view)
 SLIDER = QRect(PAD, FIELD.bottom() + 11, W - 2 * PAD, 24)
 VIEW_Y = SLIDER.bottom() + 10                     # Square|Round  ·  mask
-SHAPE_SQ = QRect(PAD, VIEW_Y, 46, 18)
-SHAPE_RD = QRect(SHAPE_SQ.right() + 1, VIEW_Y, 46, 18)
-GREY_BTN = QRect(SHAPE_RD.right() + 5, VIEW_Y, 18, 18)      # panel in greyscale
+SHAPE_SQ = QRect(PAD, VIEW_Y, 37, 18)
+SHAPE_RD = QRect(SHAPE_SQ.right() + 1, VIEW_Y, 37, 18)
+SHAPE_FO = QRect(SHAPE_RD.right() + 1, VIEW_Y, 37, 18)
+GREY_BTN = QRect(SHAPE_FO.right() + 5, VIEW_Y, 18, 18)      # panel in greyscale
 SCREEN_BTN = QRect(GREY_BTN.right() + 3, VIEW_Y, 18, 18)    # screen in greyscale
-MASK_PREV = QRect(W - PAD - 124, VIEW_Y, 18, 18)
+MASK_PREV = QRect(SCREEN_BTN.right() + 4, VIEW_Y, 18, 18)
 MASK_NEXT = QRect(W - PAD - 18, VIEW_Y, 18, 18)
 MASK_NAME = QRect(MASK_PREV.right() + 1, VIEW_Y,
                   MASK_NEXT.left() - MASK_PREV.right() - 2, 18)
@@ -1075,6 +1098,18 @@ class LumaPicker(QWidget):
     def round_field(self):
         return self.settings.get("field_shape") == "round"
 
+    def view_shape(self):
+        """square, round, or the a/b plane: focus (zoomed) / full."""
+        sh = self.settings.get("field_shape", "square")
+        if sh == "focus":
+            return "focus" if self.settings.get("focus_zoom", True) else "full"
+        return "round" if sh == "round" else "square"
+
+    def toggle_zoom(self):
+        self.settings["focus_zoom"] = not self.settings.get("focus_zoom", True)
+        save_settings(self.settings)
+        self.update()
+
     def toggle_grey_panel(self):
         on = not self.settings.get("grey_panel", False)
         self.settings["grey_panel"] = on
@@ -1306,6 +1341,11 @@ class LumaPicker(QWidget):
 
     # --------------------------------------------------------------- geometry
     def ab_to_point(self, a, b):
+        shape = self.view_shape()
+        if shape in ("focus", "full"):
+            cx, cy, half = plane_view(self.value(), self.luma_mode(), shape)
+            return QPointF(FIELD.left() + (a - cx + half) / (2 * half) * FIELD.width(),
+                           FIELD.top() + (cy + half - b) / (2 * half) * FIELD.height())
         if self.round_field():
             h = float(np.degrees(np.arctan2(b, a))) % 360.0
             cm = float(cmax_at(max_chroma(self.value(), self.luma_mode()), h))
@@ -1320,6 +1360,12 @@ class LumaPicker(QWidget):
         return QPointF(FIELD.left() + fx * FIELD.width(), FIELD.top() + fy * FIELD.height())
 
     def point_to_ab(self, p):
+        shape = self.view_shape()
+        if shape in ("focus", "full"):
+            cx, cy, half = plane_view(self.value(), self.luma_mode(), shape)
+            fx = min(max((p.x() - FIELD.left()) / FIELD.width(), 0.0), 1.0)
+            fy = min(max((p.y() - FIELD.top()) / FIELD.height(), 0.0), 1.0)
+            return cx - half + fx * 2 * half, cy + half - fy * 2 * half
         if self.round_field():
             rad = FIELD.width() / 2
             x = (p.x() - FIELD.center().x() - 0.5) / rad
@@ -1435,7 +1481,9 @@ class LumaPicker(QWidget):
             return
         p = e.position()
         pt = p.toPoint()
-        if FIELD.contains(pt):
+        if ZOOM_BTN.contains(pt) and self.settings.get("field_shape") == "focus":
+            self.toggle_zoom()
+        elif FIELD.contains(pt):
             self.dragging = "field"
             self._drag_field(p)
         elif SLIDER.adjusted(0, -4, 0, 4).contains(pt):
@@ -1447,8 +1495,9 @@ class LumaPicker(QWidget):
             self.toggle_grey_panel()
         elif SCREEN_BTN.contains(pt):
             self.toggle_screen_grey()
-        elif SHAPE_SQ.contains(pt) or SHAPE_RD.contains(pt):
-            self.set_shape("round" if SHAPE_RD.contains(pt) else "square")
+        elif SHAPE_SQ.contains(pt) or SHAPE_RD.contains(pt) or SHAPE_FO.contains(pt):
+            self.set_shape("round" if SHAPE_RD.contains(pt) else
+                           "focus" if SHAPE_FO.contains(pt) else "square")
         elif MASK_PREV.contains(pt):
             self.cycle_mask(-1)
         elif MASK_NEXT.contains(pt) or MASK_NAME.contains(pt):
@@ -1520,7 +1569,7 @@ class LumaPicker(QWidget):
         pt = e.position().toPoint()
         over_btn = any(r.contains(pt) for r in (CLOSE_BTN, PIN_BTN, TOP_BTN, EYE_BTN, HEX_RECT,
                                                MODE_BTN, COPY_BTN, OLD_SW, NEW_SW, SHAPE_SQ,
-                                               SHAPE_RD, MASK_PREV, MASK_NAME, MASK_NEXT,
+                                               SHAPE_RD, SHAPE_FO, MASK_PREV, MASK_NAME, MASK_NEXT,
                                                GREY_BTN, SCREEN_BTN, LINK_BTN))
         if not (self.dragging or e.buttons()):
             self._show_tip(pt, e.globalPosition().toPoint())
@@ -1603,6 +1652,7 @@ class LumaPicker(QWidget):
             (SLIDER, "Value. Drag, or use the mouse wheel for 1% steps"),
             (SHAPE_SQ, "Square field: hue left to right, pale to strong top to bottom"),
             (SHAPE_RD, "Round wheel: hue around the circle, strongest at the edge"),
+            (SHAPE_FO, "Focus: the plain color plane of this value, grey where no color exists"),
             (GREY_BTN, "Show this panel in greyscale: the field turns one flat grey "
                        "because every color in it has the same value"),
             (SCREEN_BTN, "Whole screen in greyscale (%s): paint in values only. "
@@ -1653,7 +1703,7 @@ class LumaPicker(QWidget):
         fast = self.dragging in ("slider", "rot", "wid") or self.wheel_timer.isActive()
         luma = self.luma_mode()
         v = self.value()
-        shape = "round" if self.round_field() else "square"
+        shape = self.view_shape()
         mask = self.mask()
         fk = (round(v, 3 if fast else 4), dpr, fast, luma, LUMA_W, shape, mask, self.cells())
         if fk != self._field_key:
@@ -1783,6 +1833,14 @@ class LumaPicker(QWidget):
             p.setPen(QPen(QColor(BG), 2.2))
             p.drawEllipse(QRectF(FIELD).adjusted(-0.5, -0.5, 0.5, 0.5))
 
+        if self.settings.get("field_shape") == "focus":      # Focus / Full switch
+            zoom = self.settings.get("focus_zoom", True)
+            p.setPen(QPen(QColor(BORDER if zoom else "#3a3a46"), 1))
+            p.setBrush(QColor(BG))
+            p.drawRoundedRect(QRectF(ZOOM_BTN), 9, 9)
+            p.setFont(QFont("Segoe UI", 8))
+            p.setPen(QColor(TEXT))
+            p.drawText(QRectF(ZOOM_BTN), Qt.AlignCenter, "Focus" if zoom else "Full")
         ea, eb = self.effective_ab()
         pt = self.ab_to_point(ea, eb)
         p.setBrush(Qt.NoBrush)
@@ -1808,17 +1866,19 @@ class LumaPicker(QWidget):
         # ---- field shape switch + gamut mask
         small8 = QFont("Segoe UI", 8)
         p.setFont(small8)
-        rnd = self.round_field()
+        sh = self.settings.get("field_shape", "square")
         seg = QPainterPath()
-        seg.addRoundedRect(QRectF(SHAPE_SQ.united(SHAPE_RD)), 9, 9)
+        seg.addRoundedRect(QRectF(SHAPE_SQ.united(SHAPE_FO)), 9, 9)
         p.setPen(QPen(QColor("#3a3a46"), 1))
         p.setBrush(Qt.NoBrush)
         p.drawPath(seg)
         p.save()
         p.setClipPath(seg)
-        p.fillRect(SHAPE_RD if rnd else SHAPE_SQ, QColor(ACTIVE))
+        p.fillRect({"round": SHAPE_RD, "focus": SHAPE_FO}.get(sh, SHAPE_SQ), QColor(ACTIVE))
         p.restore()
-        for rect, label, on in ((SHAPE_SQ, "Square", not rnd), (SHAPE_RD, "Round", rnd)):
+        for rect, label, on in ((SHAPE_SQ, "Square", sh not in ("round", "focus")),
+                                (SHAPE_RD, "Round", sh == "round"),
+                                (SHAPE_FO, "Focus", sh == "focus")):
             p.setPen(QColor(TEXT if on else DIM))
             p.drawText(QRectF(rect), Qt.AlignCenter, label)
 

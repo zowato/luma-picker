@@ -80,7 +80,8 @@ connected, the panel shows a warning and picks don't reach Clip Studio.
 | Click or drag in the field, lift the pen | Send that color to Clip Studio |
 | Drag the bar under the field | Change lightness |
 | Mouse wheel over the field or bar | Nudge the value 1% per notch |
-| **Square / Round** (under the bar) | Switch the field between the square view and a hue wheel |
+| **Square / Round / Focus** (under the bar) | Switch the field between the square view, a hue wheel and the color plane |
+| **Focus / Full** (corner of the Focus view) | Zoom the plane to this value's colors, or show the whole plane |
 | **‹ mask ›**, Rotate, Width | Pick a gamut mask, turn it and set how wide each sector is |
 | Click **L / Y** next to the hex | Switch between perceptual and Clip Studio luminance value |
 | Click a recent, shading or harmony swatch | Send that color |
@@ -110,7 +111,8 @@ needed.
 | `eyedropper_hotkey` | `ctrl+alt+shift+e` | Start the screen eyedropper (`""` to turn off) |
 | `hue_shift_strength` | `1.0` | How strongly shading shifts hue (0.5 subtle, 2 strong) |
 | `greyscale_hotkey` | `ctrl+alt+shift+g` | Whole screen in greyscale on/off (`""` to turn off). Covers every monitor and uses the `luma_weights` grey |
-| `field_shape` | `square` | `round` shows the hue wheel |
+| `field_shape` | `square` | `round` shows the hue wheel, `focus` the color plane |
+| `focus_zoom` | `true` | Focus view zoomed to this value's colors (`false`: the whole plane) |
 | `field_cells` | `24` | Color blocks per side of the square field (4 to 96) |
 | `mask` / `mask_rotate` / `mask_width` | `0` / `0` / `60` | Gamut mask (0 off, 1 analogous, 2 complementary, 3 split, 4 triad), its turn and sector width in degrees |
 | `value_mode` | `perceptual` | `luminance` keeps Clip Studio's grey-layer value instead of OKLab lightness |

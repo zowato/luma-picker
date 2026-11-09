@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **Focus view**: the color plane of one value (the original field) is back as a third option next to Square and Round, with a Focus/Full switch to zoom in on the colors or show the whole plane
 - **Direct connection to Clip Studio**: click Connect in the panel, then File > Connect to smartphone in Clip Studio. Colors go straight in. The panel warns when it isn't connected
 - Removed the screen-pick hand-off (the color dot, the Ctrl+Alt+Shift+O shortcut and its settings)
 - **Clip Studio luminance value mode**: click `L` next to the hex to switch to `Y`, which keeps the grey value Clip Studio shows with a grey Color-blend layer (field, bar and harmonies all follow it)

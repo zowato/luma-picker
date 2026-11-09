@@ -213,3 +213,21 @@ def test_auth_detail_xors_secrets():
     d = cl.auth_detail("G#1:2022.12", "ab", "cd")
     assert d[0] == "G#1:2022.12"
     assert bytes.fromhex(d[1]) == bytes([ord("a") ^ 0xB6, ord("b") ^ 0xD5])
+
+
+@pytest.mark.parametrize("shape", ["focus", "full"])
+@pytest.mark.parametrize("luma", [False, True])
+def test_focus_plane_is_one_value(shape, luma):
+    v = 0.6
+    A, B, _ = lp.field_ab(48, v, luma, shape)
+    L = lp.L_for_luma(v, A, B) if luma else np.full_like(A, v)
+    r, g, b = lp.oklab_to_linear(L, A, B)
+    ok = lp.in_gamut(r, g, b)
+    assert 0.05 < ok.mean() < 0.95                 # a slice with grey around it
+    if luma:
+        s = lp.linear_to_srgb(np.stack([r[ok], g[ok], b[ok]]))
+        assert np.allclose(lp.luma_of_srgb(*s), v, atol=2e-3)
+
+
+def test_focus_zooms_in_on_the_slice():
+    assert lp.plane_view(0.9, False, "focus")[2] < lp.plane_view(0.9, False, "full")[2]
