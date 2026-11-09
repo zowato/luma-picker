@@ -1272,7 +1272,12 @@ class LumaPicker(QWidget):
 
     def start_eyedropper(self, target="main"):
         self.sample_target = target
-        self.sampler.start()
+        if getattr(self, "screen_grey", False):
+            # grab the real colors, then the frozen screen goes grey again
+            set_screen_grey(False)
+            QTimer.singleShot(60, lambda: (self.sampler.start(), set_screen_grey(True)))
+        else:
+            self.sampler.start()
 
     def _on_sampled(self, hx):
         if self.sample_target == "main":
@@ -1431,11 +1436,15 @@ class LumaPicker(QWidget):
             self._finish_apply(hx)
             return
         self.applying = True
+        # CSP samples what the screen shows: lift the grey effect during the pick
+        grey = getattr(self, "screen_grey", False)
+        if grey:
+            set_screen_grey(False)
         self._flash_on(hx)
         QApplication.processEvents()
         focus(self.target_hwnd)
         # give Windows a frame or two to actually put the dot on screen
-        QTimer.singleShot(int(self.settings.get("flash_ms", 35)),
+        QTimer.singleShot(int(self.settings.get("flash_ms", 35)) + (50 if grey else 0),
                           lambda: self._step_shortcut(hx))
 
     def _step_shortcut(self, hx):
@@ -1505,6 +1514,8 @@ class LumaPicker(QWidget):
         self.flash = None
         self.applying = False
         self.dot.hide()
+        if getattr(self, "screen_grey", False):
+            set_screen_grey(True)
         if IS_WIN and not self.on_top:
             set_topmost(int(self.winId()), False)
         self.applied_hex = hx

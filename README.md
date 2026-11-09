@@ -92,7 +92,7 @@ changes to match.
 | Arrow-to-bar / pin / × (top right) | Stay in front of other windows / keep the panel open at its spot / hide |
 | Hover over any control | See what it does |
 | Half circle (next to Square/Round) | Show the panel in greyscale. The field turns one flat grey |
-| Half monitor, or **Ctrl+Alt+Shift+G** | Whole screen in greyscale to paint in values only. Press again for color |
+| Half monitor, or **Ctrl+Alt+Shift+G** | Whole screen in greyscale to paint in values only. Press again for color. Picks and the eyedropper still get real colors (the screen shows color for a split second while picking) |
 
 Map the two hotkeys to keys on your macro pad (for example in Razer Synapse)
 for one-press access.
