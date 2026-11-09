@@ -12,7 +12,7 @@
 - Masked hues are pushed darker when the picked value is light and lighter when it is dark, so the allowed hues stand out
 - **New square field**: blocks of color with hue left to right and pale (top) to strongest (bottom), all at one value. It replaces the old a/b plane view
 - **Greyscale panel** button: shows the whole panel by value, so the field turns one flat grey
-- **Greyscale screen** (button, tray menu, Ctrl+Alt+Shift+G): the whole desktop in greyscale for painting in values only.
+- **Greyscale screen** (button, tray menu, Ctrl+Alt+Shift+G): the whole desktop in greyscale for painting in values only
 - Mouse wheel over the field or bar nudges the value 1% per notch and sends the color when you stop
 
 ## 1.0.0 – first public release

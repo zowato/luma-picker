@@ -156,18 +156,7 @@ def hex_to_oklab(hx):
 
 
 # ---------------------------------------------------------- shading ideas
-# Hue anchors in OKLCH degrees: shadows lean toward blue-violet, lights
-# toward warm yellow (the "hue contrast" way of shading).
-SHADOW_HUE = 275.0
-LIGHT_HUE = 95.0
 SHADE_N = 7  # swatches per row, base color in the middle
-
-
-def _toward(h, target, amount):
-    """Rotate hue h toward target by up to `amount` degrees (shortest way)."""
-    d = (target - h + 540.0) % 360.0 - 180.0
-    step = max(-abs(amount), min(abs(amount), d))
-    return (h + step) % 360.0
 
 
 def _lch_to_hex(L, C, h):
@@ -583,95 +572,24 @@ def grey_matrix(weights):
 _mag = {}
 
 
-def _mag_setup():
-    """Load the Win32 calls for the grey overlay once."""
-    from ctypes import wintypes as w
-    V = ctypes.c_void_p
-    u, mag = ctypes.WinDLL("user32"), ctypes.WinDLL("Magnification")
-    u.CreateWindowExW.restype = V
-    u.CreateWindowExW.argtypes = (w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD, ctypes.c_int,
-                                  ctypes.c_int, ctypes.c_int, ctypes.c_int, V, V, V, V)
-    u.DefWindowProcW.restype = V
-    u.DefWindowProcW.argtypes = (V, w.UINT, V, V)
-    for f, a in (("DestroyWindow", (V,)), ("ShowWindow", (V, ctypes.c_int)),
-                 ("SetLayeredWindowAttributes", (V, w.DWORD, w.BYTE, w.DWORD)),
-                 ("SetWindowDisplayAffinity", (V, w.DWORD)),
-                 ("InvalidateRect", (V, V, w.BOOL)),
-                 ("SetWindowPos", (V, V, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                   ctypes.c_int, w.UINT))):
-        getattr(u, f).argtypes = a
-    for f, a in (("MagInitialize", ()), ("MagSetWindowSource", (V, w.RECT)),
-                 ("MagSetColorEffect", (V, V)), ("MagSetWindowTransform", (V, V)),
-                 ("MagSetWindowFilterList", (V, w.DWORD, ctypes.c_int, V))):
-        getattr(mag, f).argtypes = a
-        getattr(mag, f).restype = w.BOOL
-    if not mag.MagInitialize():
-        raise OSError("MagInitialize failed")
-    WNDPROC = ctypes.WINFUNCTYPE(V, V, w.UINT, V, V)
-
-    class WNDCLASSEXW(ctypes.Structure):
-        _fields_ = [("cbSize", w.UINT), ("style", w.UINT), ("lpfnWndProc", WNDPROC),
-                    ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
-                    ("hInstance", V), ("hIcon", V), ("hCursor", V), ("hbrBackground", V),
-                    ("lpszMenuName", w.LPCWSTR), ("lpszClassName", w.LPCWSTR), ("hIconSm", V)]
-    proc = WNDPROC(lambda h, m, wp, lp: u.DefWindowProcW(h, m, wp, lp))
-    wc = WNDCLASSEXW(cbSize=ctypes.sizeof(WNDCLASSEXW), lpfnWndProc=proc,
-                     lpszClassName="LumaGreyHost")
-    ctypes.windll.user32.RegisterClassExW(ctypes.byref(wc))
-    _mag.update(u=u, mag=mag, w=w, proc=proc)
-
-
 def set_screen_grey(on, weights=None):
-    """Whole desktop in greyscale, or back to normal. A click-through grey copy
-    of the screen sits on top. It is hidden from screen capture, so Clip
-    Studio's picker and the eyedropper still read the real colors under it.
-    False if unsupported (needs Windows 10 2004 or newer)."""
+    """Whole desktop in greyscale (Windows Magnification API full-screen
+    color effect), or back to normal. False if unsupported. Screen captures
+    see the grey too, so the eyedropper lifts it while it grabs."""
     if not IS_WIN:
         return False
     try:
-        if "u" not in _mag:
-            _mag_setup()
-        u, mag, w = _mag["u"], _mag["mag"], _mag["w"]
-        if _mag.get("host"):                       # drop the old overlay
-            _mag.pop("timer").stop()
-            u.DestroyWindow(_mag.pop("host"))
-        if not on:
-            return True
-        sm = ctypes.windll.user32.GetSystemMetrics
-        x, y, cw, ch = sm(76), sm(77), sm(78), sm(79)      # whole virtual desktop
-        host = u.CreateWindowExW(0x08 | 0x80000 | 0x20 | 0x80 | 0x08000000,
-                                 "LumaGreyHost", "", 0x80000000, x, y, cw, ch,
-                                 None, None, None, None)   # topmost layered click-through
-        if not host:
-            return False
-        u.SetLayeredWindowAttributes(host, 0, 255, 2)
-        # WDA_EXCLUDEFROMCAPTURE: pickers (and the magnifier itself) see through it
-        if not u.SetWindowDisplayAffinity(host, 0x11):
-            u.DestroyWindow(host)
-            return False
-        view = u.CreateWindowExW(0, "Magnifier", "", 0x40000000 | 0x10000000,
-                                 0, 0, cw, ch, host, None, None, None)
-        ident = (ctypes.c_float * 9)(1, 0, 0, 0, 1, 0, 0, 0, 1)
-        effect = (ctypes.c_float * 25)(*grey_matrix(weights or LUMA_W).flatten().tolist())
-        hw = ctypes.c_void_p(host)
-        if not (view and mag.MagSetWindowTransform(view, ident)
-                and mag.MagSetColorEffect(view, effect)):
-            u.DestroyWindow(host)
-            return False
-        mag.MagSetWindowFilterList(view, 0, 1, ctypes.byref(hw))
-        u.ShowWindow(host, 4)                      # SW_SHOWNOACTIVATE
-        src = w.RECT(x, y, x + cw, y + ch)
-
-        def tick():
-            mag.MagSetWindowSource(view, src)
-            u.InvalidateRect(view, None, True)
-            u.SetWindowPos(host, ctypes.c_void_p(-1), 0, 0, 0, 0, 0x13)  # stay on top
-        timer = QTimer()
-        timer.timeout.connect(tick)
-        timer.start(16)
-        _mag.update(host=host, timer=timer)
-        tick()
-        return True
+        if "dll" not in _mag:
+            dll = ctypes.WinDLL("Magnification")
+            dll.MagInitialize.restype = ctypes.c_bool
+            dll.MagSetFullscreenColorEffect.restype = ctypes.c_bool
+            dll.MagSetFullscreenColorEffect.argtypes = (ctypes.c_void_p,)
+            if not dll.MagInitialize():
+                return False
+            _mag["dll"] = dll
+        m = grey_matrix(weights or LUMA_W) if on else np.eye(5, dtype=np.float32)
+        buf = (ctypes.c_float * 25)(*m.flatten().tolist())
+        return bool(_mag["dll"].MagSetFullscreenColorEffect(ctypes.byref(buf)))
     except (OSError, AttributeError):
         return False
 
@@ -685,7 +603,6 @@ def render_slider_luma(a, b, w, h):
 
 # ------------------------------------------------------------ windows glue
 MOD_FLAG = {"alt": 0x1, "ctrl": 0x2, "shift": 0x4, "win": 0x8}
-MOD_VK = {"ctrl": 0x11, "alt": 0x12, "shift": 0x10, "win": 0x5B}
 NAMED_VK = {"space": 0x20, "tab": 0x09, "enter": 0x0D, "esc": 0x1B,
             "insert": 0x2D, "delete": 0x2E, "home": 0x24, "end": 0x23,
             "pageup": 0x21, "pagedown": 0x22, "pause": 0x13,
@@ -1310,7 +1227,12 @@ class LumaPicker(QWidget):
 
     def start_eyedropper(self, target="main"):
         self.sample_target = target
-        self.sampler.start()
+        if getattr(self, "screen_grey", False):
+            # the grab would be grey too: lift the effect for the snapshot only
+            set_screen_grey(False)
+            QTimer.singleShot(60, lambda: (self.sampler.start(), set_screen_grey(True)))
+        else:
+            self.sampler.start()
 
     def _on_sampled(self, hx):
         if self.sample_target == "main":

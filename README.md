@@ -17,10 +17,12 @@ of an object's surroundings. Colors go straight into **Clip Studio Paint**.
   it to switch to `Y`, Clip Studio luminance: the grey you see when you check
   values with a grey layer in **Color** blend mode. Use `Y` if you check your
   values that way in Clip Studio.
-- **Square or round.** Both show colors of one value only. The square is a
-  grid of color blocks with hue running left to right, from pale at the top to
-  the strongest color each hue can have at the bottom. On the round wheel the
-  angle is the hue and the edge is the strongest color.
+- **Square, Round or Focus.** All three show colors of one value only. The
+  square is a grid of color blocks with hue running left to right, from pale at
+  the top to the strongest color each hue can have at the bottom. On the round
+  wheel the angle is the hue and the edge is the strongest color. Focus shows
+  the plain color plane of that value, with grey where no color exists. Its
+  Focus/Full switch zooms in on the colors or shows the whole plane.
 - **Gamut masks** (analogous, complementary, split complementary, triad) limit
   you to a few hue sectors that you can rotate and widen. Masked hues stay
   visible but dimmed. If you drag into one, the pick slides to the nearest
@@ -38,6 +40,11 @@ of an object's surroundings. Colors go straight into **Clip Studio Paint**.
   - **Floor:** the cast shadow, from the dark contact shadow under the object
     out to the soft edge.
   - **Bounce:** the surroundings reflected into the object's shadow side.
+- **Direct to Clip Studio.** Picked colors go straight into Clip Studio over
+  its companion connection. Nothing reads the screen and the mouse is never
+  taken over.
+- **Greyscale.** Show the panel, or the whole screen, in greyscale to paint in
+  values only.
 - **Eyedropper.** Pick any color on screen (canvas, references, Clip Studio's
   own color) into Luma, with the button or a hotkey.
 - **Hex.** Click the hex code to copy it, or right-click it to paste one from
@@ -93,8 +100,8 @@ connected, the panel shows a warning and picks don't reach Clip Studio.
 | Arrow-to-bar / pin / × (top right) | Stay in front of other windows / keep the panel open at its spot / hide |
 | **Connect** (top of the panel) | Connect to Clip Studio, see above |
 | Hover over any control | See what it does |
-| Half circle (next to Square/Round) | Show the panel in greyscale. The field turns one flat grey |
-| Half monitor, or **Ctrl+Alt+Shift+G** | Whole screen in greyscale to paint in values only. Press again for color. Picks still reach Clip Studio |
+| Half circle (next to Square/Round/Focus) | Show the panel in greyscale. The field turns one flat grey |
+| Half monitor, or **Ctrl+Alt+Shift+G** | Whole screen in greyscale to paint in values only. Press again for color. Picks still reach Clip Studio in color. The eyedropper shows color for a moment while it takes its snapshot |
 
 Map the two hotkeys to keys on your macro pad (for example in Razer Synapse)
 for one-press access.
@@ -102,8 +109,9 @@ for one-press access.
 ## Settings
 
 Right-click the tray icon and choose **Open settings file**. The file is
-`%APPDATA%\LumaPicker\settings.json` and changes apply right away, no restart
-needed.
+`%APPDATA%\LumaPicker\settings.json`. Most changes apply right away. Hotkey
+changes (`hotkey`, `eyedropper_hotkey`, `greyscale_hotkey`) need a restart of
+Luma Picker.
 
 | Setting | Default | What it does |
 |---|---|---|

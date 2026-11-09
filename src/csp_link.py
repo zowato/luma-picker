@@ -111,12 +111,6 @@ class CspLink(QObject):
         self.pairing = dict(qr, new=base64.b64encode(os.urandom(6)).decode().rstrip("="))
         self.sock.connectToHost("127.0.0.1", qr["port"])
 
-    def unpair(self):
-        self.cfg.clear()
-        self.save()
-        self.sock.abort()
-        self.ready = False
-
     def set_color(self, hx):
         """Send a color. False if the link is not up (use the fallback)."""
         if not self.ready:

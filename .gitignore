@@ -12,7 +12,6 @@ venv/
 
 # personal settings, history and logs (never commit these)
 settings.json
-pick_log.txt
 error_log.txt
 log.txt
 build_result.txt
