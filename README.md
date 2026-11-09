@@ -13,6 +13,12 @@ of an object's surroundings. Colors go straight into **Clip Studio Paint**.
 - **Lightness-locked color field.** Pick any hue or saturation at one fixed
   value. The bar below changes the lightness. The grey around the colors is the
   neutral grey of the same value.
+- **Two ways to measure value.** `L` (perceptual, OKLab) is the default. Click
+  it to switch to `Y`, Clip Studio luminance: the grey you see when you check
+  values with a grey layer in **Color** blend mode. Use `Y` if you check your
+  values that way in Clip Studio.
+- **Mouse wheel** over the field or the bar nudges the value 1% per notch. The
+  color goes to Clip Studio once you stop scrolling.
 - **Shading** suggests 3 shadows and 3 lights for your color. Shadows get
   cooler, more saturated and darker. Lights get warmer, less saturated and
   lighter. Yellows darken through orange instead of turning green, and blues
@@ -64,6 +70,8 @@ changes to match.
 | **Ctrl+Alt+Shift+E** | Eyedropper: click any color on screen to load it into Luma |
 | Click or drag in the field, lift the pen | Send that color to Clip Studio |
 | Drag the bar under the field | Change lightness |
+| Mouse wheel over the field or bar | Nudge the value 1% per notch |
+| Click **L / Y** next to the hex | Switch between perceptual and Clip Studio luminance value |
 | Click a recent, shading or harmony swatch | Send that color |
 | **Jump on/off** (Shading) | On: the wheel moves to the shade you picked. Off: the rows stay put |
 | **‹ name ›** (Harmony) | Switch the harmony scheme |
@@ -88,6 +96,9 @@ needed.
 | `pick_shortcut` | `ctrl+alt+shift+o` | Must match the shortcut you gave *Pick screen color* in Clip Studio |
 | `apply_mode` | `screen_pick` | `clipboard` only copies the hex instead of sending it to Clip Studio |
 | `hue_shift_strength` | `1.0` | How strongly shading shifts hue (0.5 subtle, 2 strong) |
+| `value_mode` | `perceptual` | `luminance` keeps Clip Studio's grey-layer value instead of OKLab lightness |
+| `luma_weights` | `[0.30, 0.59, 0.11]` | R, G, B weights for `luminance`. Adjust if Clip Studio's grey check disagrees |
+| `wheel_step` / `wheel_send_ms` | `0.01` / `350` | Value change per wheel notch / pause before the color is sent |
 | `after_pick_shortcut` | `""` | A key to press after each pick, e.g. `"b"` to return to the brush |
 | `picker_ready_ms` | `150` | Wait before clicking in Clip Studio's picker. Raise if colors sometimes don't arrive |
 | `exit_delay_ms` | `90` | Pause before closing Clip Studio's picker |

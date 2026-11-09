@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Clip Studio luminance value mode**: click `L` next to the hex to switch to `Y`, which keeps the grey value Clip Studio shows with a grey Color-blend layer (field, bar and harmonies all follow it)
+- Mouse wheel over the field or bar nudges the value 1% per notch and sends the color when you stop
+
 ## 1.0.0 – first public release
 
 - Lightness-locked color field (every color in it has the same perceptual value) with a lightness bar

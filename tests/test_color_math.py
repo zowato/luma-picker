@@ -78,3 +78,42 @@ def test_parse_combo():
     assert lp.parse_combo("F13")[1] == 0x7C
     with pytest.raises(ValueError):
         lp.parse_combo("ctrl+nonsense")
+
+
+# ---- "luminance" value mode (Clip Studio's grey-layer check)
+def _luma(hx):
+    return lp.luma_of_hex(hx)
+
+
+@pytest.mark.parametrize("Y", [0.15, 0.4, 0.64, 0.9])
+def test_luma_field_is_one_luminance(Y):
+    cx, cy, half = lp.fit_for_luma(Y)
+    t = np.linspace(-half, half, 40)
+    A, B = np.meshgrid(cx + t, cy + t)
+    r, g, b = lp.oklab_to_linear(lp.L_for_luma(Y, A, B), A, B)
+    ok = lp.in_gamut(r, g, b)
+    assert ok.mean() > 0.1
+    s = lp.linear_to_srgb(np.stack([r[ok], g[ok], b[ok]]))
+    assert np.allclose(lp.luma_of_srgb(*s), Y, atol=2e-3)
+
+
+def test_luma_color_hits_target_and_fits_gamut():
+    for hue in range(0, 360, 30):
+        h = np.radians(hue)
+        L, a, b = lp.luma_color(0.6, 0.3 * np.cos(h), 0.3 * np.sin(h))
+        assert abs(_luma(lp.oklab_to_hex(float(L), float(a), float(b))) - 0.6) < 0.01
+
+
+def test_luma_differs_from_perceptual():
+    # same OKLab L, very different grey value: the reason the mode exists
+    L = 0.6
+    red = lp._lch_to_hex(L, 0.4, 20)
+    green = lp._lch_to_hex(L, 0.4, 120)
+    assert abs(_luma(red) - _luma(green)) > 0.1
+
+
+def test_harmony_keeps_luminance():
+    L, a, b = lp.hex_to_oklab("#c0607a")
+    Y = _luma("#c0607a")
+    for hx, _h, _base in lp.harmony_colors(L, a, b, (0, 120, 240), luma=Y):
+        assert abs(_luma(hx) - Y) < 0.01

@@ -52,6 +52,10 @@ DEFAULTS = {
     "flash_ms": 35,                # time for the color dot to appear
     "picker_ready_ms": 150,        # earliest click after CSP's picker opens
     "hue_shift_strength": 1.0,     # 0.5 = subtle, 2 = strong hue shifting
+    "value_mode": "perceptual",    # or "luminance" (Clip Studio's grey check)
+    "luma_weights": [0.30, 0.59, 0.11],   # R, G, B weights of "luminance"
+    "wheel_step": 0.01,            # mouse wheel over field/bar: value per notch
+    "wheel_send_ms": 350,          # send to CSP this long after the last notch
     "right_click_to_exit_pick": True,
     "after_pick_shortcut": "",            # e.g. "b" to go back to the brush
     "also_copy_hex": False,
@@ -255,8 +259,9 @@ HARMONIES = [
 ]
 
 
-def harmony_colors(L, a, b, offsets):
+def harmony_colors(L, a, b, offsets, luma=None):
     """Partner colors at the same lightness, rotated around the hue wheel.
+    luma: keep this luminance instead (the "luminance" value mode).
     Returns [(hex, hue_degrees, is_base), ...] in the order given."""
     a, b = (float(v) for v in clamp_chroma(L, a, b))
     C = float(np.hypot(a, b))
@@ -269,7 +274,13 @@ def harmony_colors(L, a, b, offsets):
             continue
         hk = (h + off) % 360.0
         # a grey has no hue of its own: give the partners a gentle tint
-        out.append((_lch_to_hex(L, 0.08 if neutral else C, hk), hk, False))
+        Ck = 0.08 if neutral else C
+        if luma is None:
+            out.append((_lch_to_hex(L, Ck, hk), hk, False))
+        else:
+            r = np.radians(hk)
+            Lk, ak, bk = luma_color(luma, Ck * np.cos(r), Ck * np.sin(r))
+            out.append((oklab_to_hex(float(Lk), float(ak), float(bk)), hk, False))
     return out
 
 
@@ -364,6 +375,110 @@ def render_slider(a, b, w, h):
     Ls = (np.arange(w) + 0.5) / w
     aa, bb = clamp_chroma(Ls, np.full(w, a), np.full(w, b))
     rgb = linear_to_srgb(np.stack(oklab_to_linear(Ls, aa, bb), axis=-1))
+    return _to_qimage(np.repeat(rgb[None, :, :], h, axis=0))
+
+
+# ------------------------------------------------- "luminance" value mode
+# Value the way Clip Studio shows it when you check values with a grey layer
+# in Color blend mode: a weighted sum of the gamma-encoded sRGB channels
+# (the usual Color-blend formula). Set from settings["luma_weights"].
+LUMA_W = (0.30, 0.59, 0.11)
+
+
+def apply_luma_weights(settings):
+    global LUMA_W
+    try:
+        w = tuple(float(x) for x in settings.get("luma_weights", LUMA_W))
+        if len(w) == 3 and sum(w) > 0:
+            LUMA_W = tuple(x / sum(w) for x in w)
+    except (TypeError, ValueError):
+        pass
+
+
+def luma_of_srgb(r, g, b):
+    return LUMA_W[0] * r + LUMA_W[1] * g + LUMA_W[2] * b
+
+
+def luma_of_hex(hx):
+    return float(luma_of_srgb(*_hex_rgb(hx)))
+
+
+def L_for_luma(Y, a, b, iters=18):
+    """OKLab L that gives hue/chroma (a, b) the luminance Y (vectorized)."""
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    lo = np.zeros(np.broadcast(Y, a, b).shape)
+    hi = np.ones_like(lo)
+    for _ in range(iters):
+        mid = (lo + hi) / 2
+        r, g, bl = linear_to_srgb(np.stack(oklab_to_linear(mid, a, b)))
+        low = luma_of_srgb(r, g, bl) < Y
+        lo = np.where(low, mid, lo)
+        hi = np.where(low, hi, mid)
+    return (lo + hi) / 2
+
+
+def luma_color(Y, a, b):
+    """(L, a, b) with luminance Y, chroma pulled in until it fits sRGB."""
+    a, b = (np.asarray(x, dtype=float) for x in np.broadcast_arrays(a, b))
+    ok = in_gamut(*oklab_to_linear(L_for_luma(Y, a, b), a, b))
+    # largest chroma (same hue) whose color of luminance Y still fits sRGB
+    lo, hi = np.zeros(np.broadcast(Y, a).shape), np.ones(np.broadcast(Y, a).shape)
+    for _ in range(16):
+        mid = (lo + hi) / 2
+        m = in_gamut(*oklab_to_linear(L_for_luma(Y, a * mid, b * mid, 14),
+                                      a * mid, b * mid))
+        lo, hi = np.where(m, mid, lo), np.where(m, hi, mid)
+    t = np.where(ok, 1.0, lo)
+    a, b = a * t, b * t
+    return L_for_luma(Y, a, b), a, b
+
+
+_fit_luma_cache = {}
+
+
+def fit_for_luma(Y):
+    """Like fit_for_L, for the slice of colors with luminance Y."""
+    key = (round(float(Y), 3), LUMA_W)
+    if key not in _fit_luma_cache:
+        h = np.linspace(0, 2 * np.pi, 144, endpoint=False)
+        lo, hi = np.zeros_like(h), np.full_like(h, 0.5)
+        for _ in range(16):
+            mid = (lo + hi) / 2
+            a, b = np.cos(h) * mid, np.sin(h) * mid
+            ok = in_gamut(*oklab_to_linear(L_for_luma(key[0], a, b, 14), a, b))
+            lo, hi = np.where(ok, mid, lo), np.where(ok, hi, mid)
+        a, b = np.cos(h) * lo, np.sin(h) * lo
+        cx, cy = (a.min() + a.max()) / 2, (b.min() + b.max()) / 2
+        half = max(a.max() - a.min(), b.max() - b.min()) / 2 * 1.14
+        _fit_luma_cache[key] = (float(cx), float(cy), float(max(half, 0.02)))
+    return _fit_luma_cache[key]
+
+
+def render_field_luma(Y, n):
+    cx, cy, half = fit_for_luma(Y)
+    t = (np.arange(n) + 0.5) / n * 2 * half - half
+    A, B = np.meshgrid(cx + t, cy - t)
+    # solving L per pixel is slow; L changes smoothly across the field, so
+    # solve it on a coarse grid and interpolate (picked colors stay exact)
+    m = max(n // 4, 24)
+    tc = (np.arange(m) + 0.5) / m * 2 * half - half
+    Lc = L_for_luma(Y, *np.meshgrid(cx + tc, cy - tc))
+    pos = np.clip((np.arange(n) + 0.5) / n * m - 0.5, 0, m - 1)
+    i0 = np.minimum(pos.astype(int), m - 2)
+    f = pos - i0
+    Lr = Lc[i0] * (1 - f)[:, None] + Lc[i0 + 1] * f[:, None]          # rows
+    L = Lr[:, i0] * (1 - f)[None, :] + Lr[:, i0 + 1] * f[None, :]     # cols
+    r, g, b = oklab_to_linear(L, A, B)
+    ok = in_gamut(r, g, b)
+    rgb = linear_to_srgb(np.stack([r, g, b], axis=-1))
+    rgb[~ok] = min(max(Y, 0.0), 1.0)      # grey of the same luminance
+    return _to_qimage(rgb)
+
+
+def render_slider_luma(a, b, w, h):
+    Ys = (np.arange(w) + 0.5) / w
+    L, aa, bb = luma_color(Ys, np.full(w, a), np.full(w, b))
+    rgb = linear_to_srgb(np.stack(oklab_to_linear(L, aa, bb), axis=-1))
     return _to_qimage(np.repeat(rgb[None, :, :], h, axis=0))
 
 
@@ -583,7 +698,9 @@ TOP_BTN = QRect(PIN_BTN.left() - 24, 12, 20, 20)
 NEW_SW = QRect(TOP_BTN.left() - 8 - 28, 13, 28, 18)
 OLD_SW = QRect(NEW_SW.left() - 28, 13, 28, 18)
 EYE_BTN = QRect(OLD_SW.left() - 26, 12, 20, 20)            # eyedropper
-HEX_RECT = QRect(PAD + 2, 12, EYE_BTN.left() - PAD - 6, 20)  # click = copy
+TOAST_RECT = QRect(PAD + 2, 12, EYE_BTN.left() - PAD - 6, 20)
+HEX_RECT = QRect(PAD + 2, 12, 60, 20)                       # click = copy
+MODE_BTN = QRect(HEX_RECT.right() + 2, 13, EYE_BTN.left() - HEX_RECT.right() - 8, 18)
 
 BG, BORDER, TEXT, DIM = "#1c1c22", "#5b4bd1", "#d8d8e4", "#7d7d8c"
 
@@ -714,8 +831,12 @@ class LumaPicker(QWidget):
         self.setWindowTitle("Luma Picker")
         self.settings = settings
         self.notify = tray_notify or (lambda *a: None)
+        apply_luma_weights(settings)
         self.L, self.a, self.b = hex_to_oklab(settings.get("last_color", "#c0607a"))
+        self.Y = luma_of_hex(oklab_to_hex(self.L, self.a, self.b))
         self.applied_hex = self.current_hex()
+        self.wheel_timer = QTimer(self, singleShot=True,
+                                  timeout=lambda: self.apply_hex(self.current_hex()))
         self.history = [h for h in settings.get("history", []) if isinstance(h, str)][:HIST_N]
         self.dragging = None
         self.applying = False
@@ -793,7 +914,36 @@ class LumaPicker(QWidget):
 
     def set_hex(self, hx):
         self.L, self.a, self.b = hex_to_oklab(hx)
+        self.Y = luma_of_hex(hx)
         self.update()
+
+    def luma_mode(self):
+        return self.settings.get("value_mode") == "luminance"
+
+    def value(self):
+        """What the bar controls: OKLab L, or luminance in "luminance" mode."""
+        return self.Y if self.luma_mode() else self.L
+
+    def set_value(self, v):
+        self.shade_base = None
+        v = min(max(v, 0.0), 1.0)
+        if self.luma_mode():
+            self.Y = v
+            self.L = float(luma_color(v, self.a, self.b)[0])
+        else:
+            self.L = v
+            self.Y = luma_of_hex(self.current_hex())
+        self.update()
+
+    def toggle_value_mode(self):
+        on = not self.luma_mode()
+        self.settings["value_mode"] = "luminance" if on else "perceptual"
+        save_settings(self.settings)
+        self.Y = luma_of_hex(self.current_hex())   # same color, new ruler
+        self.show_toast("Value: CSP luminance" if on else "Value: perceptual")
+
+    def _fit(self):
+        return fit_for_luma(self.Y) if self.luma_mode() else fit_for_L(self.L)
 
     def _base(self):
         """Color the shading/harmony rows are built from."""
@@ -814,7 +964,8 @@ class LumaPicker(QWidget):
 
     def harmonies(self):
         L, a, b = self._base()
-        return harmony_colors(L, a, b, HARMONIES[self.harmony_index()][1])
+        luma = luma_of_hex(oklab_to_hex(L, a, b)) if self.luma_mode() else None
+        return harmony_colors(L, a, b, HARMONIES[self.harmony_index()][1], luma)
 
     def cycle_harmony(self, step):
         self.settings["harmony"] = (self.harmony_index() + step) % len(HARMONIES)
@@ -904,13 +1055,13 @@ class LumaPicker(QWidget):
 
     # --------------------------------------------------------------- geometry
     def ab_to_point(self, a, b):
-        cx, cy, half = fit_for_L(self.L)
+        cx, cy, half = self._fit()
         x = FIELD.left() + (a - (cx - half)) / (2 * half) * FIELD.width()
         y = FIELD.top() + ((cy + half) - b) / (2 * half) * FIELD.height()
         return QPointF(x, y)
 
     def point_to_ab(self, p):
-        cx, cy, half = fit_for_L(self.L)
+        cx, cy, half = self._fit()
         fx = min(max((p.x() - FIELD.left()) / FIELD.width(), 0.0), 1.0)
         fy = min(max((p.y() - FIELD.top()) / FIELD.height(), 0.0), 1.0)
         return cx - half + fx * 2 * half, cy + half - fy * 2 * half
@@ -989,6 +1140,7 @@ class LumaPicker(QWidget):
 
     # ---------------------------------------------------------------- applying
     def apply_hex(self, hx):
+        self.wheel_timer.stop()
         mode = self.settings.get("apply_mode", "screen_pick")
         if mode != "screen_pick" or not IS_WIN:
             QGuiApplication.clipboard().setText(hx)
@@ -1122,6 +1274,8 @@ class LumaPicker(QWidget):
             self.set_hex(self.applied_hex)
         elif EYE_BTN.contains(pt):
             self.start_eyedropper("main")
+        elif MODE_BTN.contains(pt):
+            self.toggle_value_mode()
         elif HEX_RECT.contains(pt):
             self.copy_hex()
         elif pt.y() < HEADER_H:
@@ -1172,7 +1326,7 @@ class LumaPicker(QWidget):
             return
         pt = e.position().toPoint()
         over_btn = any(r.contains(pt) for r in (CLOSE_BTN, PIN_BTN, TOP_BTN, EYE_BTN, HEX_RECT,
-                                               OLD_SW, NEW_SW))
+                                               MODE_BTN, OLD_SW, NEW_SW))
         want = (Qt.SizeAllCursor if pt.y() < HEADER_H and not over_btn
                 else Qt.PointingHandCursor if over_btn else Qt.ArrowCursor)
         if self.cursor().shape() != want:
@@ -1210,33 +1364,56 @@ class LumaPicker(QWidget):
     def _drag_field(self, p):
         self.shade_base = None
         a, b = self.point_to_ab(p)
-        a, b = clamp_chroma(self.L, a, b)
+        if self.luma_mode():
+            L, a, b = luma_color(self.Y, a, b)
+            self.L = float(L)
+        else:
+            a, b = clamp_chroma(self.L, a, b)
         self.a, self.b = float(a), float(b)
+        if not self.luma_mode():
+            self.Y = luma_of_hex(self.current_hex())   # ready if the mode flips
         self.update()
 
     def _drag_slider(self, p):
-        self.shade_base = None
-        self.L = min(max((p.x() - SLIDER.left()) / SLIDER.width(), 0.0), 1.0)
-        self.update()
+        self.set_value((p.x() - SLIDER.left()) / SLIDER.width())
+
+    def wheelEvent(self, e):
+        """Wheel over the field or bar: nudge the value; the color goes to
+        Clip Studio once the wheel has been still for a moment."""
+        pt = e.position().toPoint()
+        if self.applying or not (FIELD.contains(pt) or SLIDER.adjusted(0, -4, 0, 4).contains(pt)):
+            return
+        notches = e.angleDelta().y() / 120.0
+        if not notches:
+            return
+        if IS_WIN:
+            fg = foreground()
+            if fg and int(fg) != int(self.winId()):
+                self.target_hwnd = fg
+        self.set_value(self.value() + notches * float(self.settings.get("wheel_step", 0.01)))
+        self.wheel_timer.start(int(self.settings.get("wheel_send_ms", 350)))
 
     # -------------------------------------------------------------- painting
     def _images(self):
         dpr = self.devicePixelRatioF()
         # half resolution while the lightness bar is being dragged: much
         # cheaper, and the full-quality field comes back on release
-        fast = self.dragging == "slider"
-        fk = (round(self.L, 3 if fast else 4), dpr, fast)
+        fast = self.dragging == "slider" or self.wheel_timer.isActive()
+        luma = self.luma_mode()
+        v = self.value()
+        fk = (round(v, 3 if fast else 4), dpr, fast, luma, LUMA_W)
         if fk != self._field_key:
             n = int(FIELD.width() * dpr)
-            img = render_field(self.L, n // 2 if fast else n)
+            n = n // 2 if fast else n
+            img = render_field_luma(v, n) if luma else render_field(v, n)
             if fast:
                 img = img.scaled(n, n, Qt.IgnoreAspectRatio, Qt.FastTransformation)
             img.setDevicePixelRatio(dpr)
             self._field_img, self._field_key = img, fk
-        sk = (round(self.a, 4), round(self.b, 4), dpr)
+        sk = (round(self.a, 4), round(self.b, 4), dpr, luma, LUMA_W)
         if sk != self._slider_key:
-            img = render_slider(self.a, self.b, int(SLIDER.width() * dpr),
-                                int(SLIDER.height() * dpr))
+            img = (render_slider_luma if luma else render_slider)(
+                self.a, self.b, int(SLIDER.width() * dpr), int(SLIDER.height() * dpr))
             img.setDevicePixelRatio(dpr)
             self._slider_img, self._slider_key = img, sk
         return self._field_img, self._slider_img
@@ -1263,15 +1440,20 @@ class LumaPicker(QWidget):
                                 QDateTime.currentMSecsSinceEpoch() < self.toast[1]) else None
         if toast:
             p.setPen(QColor("#9ee6a8"))
-            p.drawText(HEX_RECT, Qt.AlignVCenter | Qt.AlignLeft, toast[0])
+            p.drawText(TOAST_RECT, Qt.AlignVCenter | Qt.AlignLeft, toast[0])
         else:
-            # hex (click to copy, right-click to paste) + lightness
+            # hex (click to copy, right-click to paste) + value mode button
             p.drawText(HEX_RECT, Qt.AlignVCenter | Qt.AlignLeft, cur.upper())
-            font.setBold(False)
-            p.setFont(font)
-            p.setPen(QColor(DIM))
-            p.drawText(HEX_RECT.adjusted(66, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft,
-                       "L %d" % round(self.L * 100))
+            luma = self.luma_mode()
+            mr = QRectF(MODE_BTN)
+            p.setPen(QPen(QColor(BORDER if luma else "#3a3a46"), 1))
+            p.setBrush(QColor("#2e2a4a") if luma else Qt.NoBrush)
+            p.drawRoundedRect(mr, 9, 9)
+            p.setBrush(Qt.NoBrush)
+            p.setFont(QFont("Segoe UI", 8))
+            p.setPen(QColor(TEXT if luma else DIM))
+            p.drawText(mr, Qt.AlignCenter, ("Y %d" if luma else "L %d")
+                       % round(self.value() * 100))
         font.setBold(False)
         p.setFont(font)
         # eyedropper icon
@@ -1336,7 +1518,7 @@ class LumaPicker(QWidget):
         p.setClipPath(spath)
         p.drawImage(SLIDER, slider_img)
         p.restore()
-        hx = SLIDER.left() + self.L * SLIDER.width()
+        hx = SLIDER.left() + self.value() * SLIDER.width()
         handle = QRectF(hx - 6, SLIDER.top() - 3, 12, SLIDER.height() + 6)
         p.setPen(QPen(QColor("#000000a0"), 3.2))
         p.drawRoundedRect(handle, 4, 4)
@@ -1543,6 +1725,7 @@ def main():
             for k, v in fresh.items():
                 if k not in ("history", "last_color", "window_pos"):
                     settings[k] = v
+            apply_luma_weights(settings)
             picker.update()
         except Exception:
             pass
