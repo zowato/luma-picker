@@ -8,10 +8,8 @@ the neutral grey of the same lightness, so the whole field is one value.
 Extras: shading ramps (cool shadows / warm lights), color harmonies, floor
 shadow + bounce light suggestions, a screen eyedropper and hex copy/paste.
 
-Windows: a global hotkey opens the panel. Picking a color sends it to
-Clip Studio Paint through CSP's own "Pick screen color" command (give that
-command a shortcut in CSP). Elsewhere / apply_mode "clipboard": the hex code
-is copied instead.
+Windows: a global hotkey opens the panel. Picking a color sets it in
+Clip Studio Paint directly, over CSP's companion connection (csp_link.py).
 
 https://github.com/zowato/luma-picker  -  MIT License
 """
@@ -48,13 +46,6 @@ DEFAULTS = {
     "eyedropper_hotkey": "ctrl+alt+shift+e",   # pick a color from the screen
     "greyscale_hotkey": "ctrl+alt+shift+g",    # whole screen in greyscale on/off
     "grey_panel": False,                       # show the panel itself in greyscale
-    "apply_mode": "screen_pick",          # "screen_pick" or "clipboard"
-    "pick_shortcut": "ctrl+alt+shift+o",  # CSP: Edit > Pick screen color
-    "pick_apps": ["CLIPStudioPaint.exe"],  # send the shortcut only to these
-    "pick_delay_ms": 250,          # longest wait for CSP's picker window
-    "exit_delay_ms": 90,           # click -> closing right-click
-    "flash_ms": 35,                # time for the color dot to appear
-    "picker_ready_ms": 150,        # earliest click after CSP's picker opens
     "hue_shift_strength": 1.0,     # 0.5 = subtle, 2 = strong hue shifting
     "value_mode": "perceptual",    # or "luminance" (Clip Studio's grey check)
     "luma_weights": [0.30, 0.59, 0.11],   # R, G, B weights of "luminance"
@@ -65,8 +56,6 @@ DEFAULTS = {
     "mask_width": 60,              # degrees per allowed hue sector
     "wheel_step": 0.01,            # mouse wheel over field/bar: value per notch
     "wheel_send_ms": 350,          # send to CSP this long after the last notch
-    "right_click_to_exit_pick": True,
-    "after_pick_shortcut": "",            # e.g. "b" to go back to the brush
     "also_copy_hex": False,
     "auto_hide": True,
     "auto_hide_distance": 60,
@@ -709,57 +698,10 @@ def parse_combo(text):
 if IS_WIN:
     from ctypes import wintypes
     user32 = ctypes.WinDLL("user32", use_last_error=True)
-    ULONG_PTR = ctypes.c_size_t
-
-    class KEYBDINPUT(ctypes.Structure):
-        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
-                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                    ("dwExtraInfo", ULONG_PTR)]
-
-    class MOUSEINPUT(ctypes.Structure):
-        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
-                    ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
-                    ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
-
-    class HARDWAREINPUT(ctypes.Structure):
-        _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
-                    ("wParamH", wintypes.WORD)]
-
-    class _INPUTUNION(ctypes.Union):
-        _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
-
-    class INPUT(ctypes.Structure):
-        _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
-
-    user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
     user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
     user32.GetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int)
     user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
     user32.SetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t)
-    user32.GetForegroundWindow.restype = wintypes.HWND
-    user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
-    user32.IsWindow.argtypes = (wintypes.HWND,)
-
-    def _send(inputs):
-        arr = (INPUT * len(inputs))(*inputs)
-        user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
-
-    def _key(vk, up=False):
-        scan = user32.MapVirtualKeyW(vk, 0)
-        return INPUT(type=1, u=_INPUTUNION(ki=KEYBDINPUT(
-            wVk=vk, wScan=scan, dwFlags=0x2 if up else 0, time=0, dwExtraInfo=0)))
-
-    def send_combo(text):
-        mods, vk = parse_combo(text)
-        down = [_key(MOD_VK[m]) for m in mods] + [_key(vk)]
-        up = [_key(vk, True)] + [_key(MOD_VK[m], True) for m in reversed(mods)]
-        _send(down + up)
-
-    def click(button="left"):
-        d, u = (0x2, 0x4) if button == "left" else (0x8, 0x10)
-        mk = lambda f: INPUT(type=0, u=_INPUTUNION(mi=MOUSEINPUT(
-            dx=0, dy=0, mouseData=0, dwFlags=f, time=0, dwExtraInfo=0)))
-        _send([mk(d), mk(u)])
 
     def set_noactivate(hwnd):
         GWL_EXSTYLE = -20
@@ -775,58 +717,6 @@ if IS_WIN:
         # HWND_TOPMOST / HWND_NOTOPMOST; SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE
         user32.SetWindowPos(hwnd, wintypes.HWND(-1 if on else -2), 0, 0, 0, 0,
                             0x0001 | 0x0002 | 0x0010)
-
-    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    user32.EnumWindows.argtypes = (WNDENUMPROC, wintypes.LPARAM)
-    user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND,
-                                                ctypes.POINTER(wintypes.DWORD))
-    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
-
-    def window_pid(hwnd):
-        pid = wintypes.DWORD(0)
-        if hwnd:
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        return pid.value
-
-    def visible_windows_of(pid):
-        """Visible top-level windows belonging to a process."""
-        found = set()
-
-        def cb(h, _):
-            if user32.IsWindowVisible(h) and window_pid(h) == pid:
-                found.add(int(h) if h else 0)
-            return True
-        user32.EnumWindows(WNDENUMPROC(cb), 0)
-        return found
-
-    def foreground():
-        return user32.GetForegroundWindow()
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.OpenProcess.restype = wintypes.HANDLE
-    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-    kernel32.QueryFullProcessImageNameW.argtypes = (
-        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
-
-    def exe_name(hwnd):
-        """File name of the program that owns a window, e.g. CLIPStudioPaint.exe."""
-        pid = window_pid(hwnd)
-        h = kernel32.OpenProcess(0x1000, False, pid) if pid else None  # QUERY_LIMITED
-        if not h:
-            return ""
-        try:
-            buf = ctypes.create_unicode_buffer(520)
-            n = wintypes.DWORD(len(buf))
-            if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
-                return os.path.basename(buf.value)
-            return ""
-        finally:
-            kernel32.CloseHandle(h)
-
-    def focus(hwnd):
-        if hwnd and user32.IsWindow(hwnd) and user32.GetForegroundWindow() != hwnd:
-            user32.SetForegroundWindow(hwnd)
 
 
 class HotkeyWindow(QWidget):
@@ -857,7 +747,9 @@ class HotkeyWindow(QWidget):
 W = 288
 PAD = 12
 HEADER_H = 44                      # drag the window by this top bar
-FIELD = QRect(PAD, 46, W - 2 * PAD, W - 2 * PAD)
+LINK_RECT = QRect(PAD, 44, W - 2 * PAD, 32)     # Clip Studio connection status
+LINK_BTN = QRect(W - PAD - 64, 45, 64, 16)
+FIELD = QRect(PAD, LINK_RECT.bottom() + 5, W - 2 * PAD, W - 2 * PAD)
 SLIDER = QRect(PAD, FIELD.bottom() + 11, W - 2 * PAD, 24)
 VIEW_Y = SLIDER.bottom() + 10                     # Square|Round  ·  mask
 SHAPE_SQ = QRect(PAD, VIEW_Y, 46, 18)
@@ -1041,38 +933,6 @@ class ScreenSampler(QObject):
             self.picked.emit(hx)
 
 
-class FlashDot(QWidget):
-    """A few pixels of the picked color right under the pen tip. Clip Studio's
-    screen picker samples this instead of the whole panel changing color."""
-    SIZE = 9
-
-    def __init__(self):
-        # click-through: the pick click must land on the panel underneath,
-        # Clip Studio ignores clicks that hit this little window itself
-        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint
-                         | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus
-                         | Qt.WindowTransparentForInput)
-        self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.setFixedSize(self.SIZE, self.SIZE)
-        self.color = QColor("#000000")
-        if IS_WIN:
-            set_noactivate(int(self.winId()))
-
-    def show_at_cursor(self, hx):
-        self.color = QColor(hx)
-        pos = QCursor.pos()
-        self.move(pos.x() - self.SIZE // 2, pos.y() - self.SIZE // 2)
-        if not self.isVisible():
-            self.show()
-        if IS_WIN:
-            set_topmost(int(self.winId()), True)
-        self.repaint()
-
-    def paintEvent(self, _):
-        QPainter(self).fillRect(self.rect(), self.color)
-
-
 class LumaPicker(QWidget):
     def __init__(self, settings, tray_notify=None):
         self.on_top = bool(settings.get("always_on_top", True))
@@ -1095,11 +955,7 @@ class LumaPicker(QWidget):
                                   timeout=lambda: self.apply_hex(self.current_hex()))
         self.history = [h for h in settings.get("history", []) if isinstance(h, str)][:HIST_N]
         self.dragging = None
-        self.applying = False
-        self.flash = None
-        self.dot = FlashDot()
         self.pinned = bool(settings.get("pinned", False))
-        self.target_hwnd = None
         self.move_offset = None
         self._field_key = self._slider_key = None
         self._shade_key = None
@@ -1350,17 +1206,20 @@ class LumaPicker(QWidget):
         self.update()
 
     def start_pairing(self):
-        """Wait for Clip Studio's pairing QR code on screen, then connect."""
-        self.pair_left = 90                       # about one minute
-        self.pair_timer.start()
-        self.notify("In Clip Studio open File > Connect to smartphone. "
-                    "Luma reads the QR code from the screen.")
+        """Connect button: wait for Clip Studio's pairing QR code on screen
+        (File > Connect to smartphone), then connect. Click again to cancel."""
+        if self.pair_timer.isActive():
+            self.pair_timer.stop()
+        else:
+            self.pair_left = 90                   # about one minute
+            self.pair_timer.start()
+        self.update()
 
     def _look_for_qr(self):
         self.pair_left -= 1
         if self.pair_left <= 0:
             self.pair_timer.stop()
-            self.notify("No Clip Studio QR code found. Try Connect to Clip Studio again.")
+            self.show_toast("No QR code found", 2500)
             return
         for scr in QGuiApplication.screens():
             qr = decode_qr(find_qr_url(scr.grabWindow(0).toImage()) or "")
@@ -1371,11 +1230,48 @@ class LumaPicker(QWidget):
 
     def _on_link(self, state):
         if state == "paired":
-            self.notify("Connected to Clip Studio. You can close its QR window.")
+            self.show_toast("Connected! Close the QR window", 3000)
         elif state.startswith("failed:"):
-            self.notify("Clip Studio refused the connection (%s). Try Connect to "
-                        "Clip Studio again." % state[7:])
+            self.show_toast("Clip Studio refused (%s)" % state[7:], 4000)
         self.update()
+
+    def _paint_link(self, p):
+        """Status row under the header: connected, or a warning with how to fix it."""
+        r = LINK_RECT
+        busy = self.pair_timer.isActive() or bool(self.link.pairing)
+        if self.link.ready:
+            head, sub, col, btn = "Connected to Clip Studio", "Colors go straight in", "#9ee6a8", None
+        elif busy:
+            head, sub, col, btn = ("Looking for the QR code...",
+                                   "Clip Studio: File > Connect to smartphone", BORDER, "Cancel")
+        elif self.link.paired():
+            head, sub, col, btn = ("Not connected to Clip Studio",
+                                   "Start Clip Studio, or click Connect to pair again",
+                                   "#ff8a5c", "Connect")
+        else:
+            head, sub, col, btn = ("Not connected to Clip Studio",
+                                   "Click Connect, then File > Connect to smartphone in CSP",
+                                   "#ff8a5c", "Connect")
+        f = QFont("Segoe UI", 8)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(col))
+        p.setBrush(QColor(col))
+        p.drawEllipse(QRectF(r.left() + 1, r.top() + 6, 6, 6))
+        p.drawText(QRect(r.left() + 11, r.top(), r.width() - 80, 18),
+                   Qt.AlignVCenter | Qt.AlignLeft, head)
+        f.setBold(False)
+        f.setPointSizeF(7.5)
+        p.setFont(f)
+        p.setPen(QColor(DIM))
+        p.drawText(QRect(r.left() + 11, r.top() + 16, r.width() - 11, 16),
+                   Qt.AlignVCenter | Qt.AlignLeft, sub)
+        if btn:
+            p.setPen(QPen(QColor(col), 1))
+            p.setBrush(QColor(ACTIVE))
+            p.drawRoundedRect(QRectF(LINK_BTN), 8, 8)
+            p.setPen(QColor(TEXT))
+            p.drawText(LINK_BTN, Qt.AlignCenter, btn)
 
     def start_eyedropper(self, target="main"):
         self.sample_target = target
@@ -1457,8 +1353,6 @@ class LumaPicker(QWidget):
         self.move(x, y)
 
     def show_at_cursor(self):
-        if IS_WIN:
-            self.target_hwnd = foreground()
         pos = QCursor.pos()
         saved = self._saved_pos() if self.pinned else None
         if saved is not None:
@@ -1504,7 +1398,7 @@ class LumaPicker(QWidget):
             self.show_at_cursor()
 
     def _check_auto_hide(self):
-        if (not self.isVisible() or self.pinned or self.applying or self.dragging
+        if (not self.isVisible() or self.pinned or self.dragging
                 or self.move_offset is not None
                 or not self.settings.get("auto_hide", True)):
             return
@@ -1515,110 +1409,13 @@ class LumaPicker(QWidget):
     # ---------------------------------------------------------------- applying
     def apply_hex(self, hx):
         self.wheel_timer.stop()
-        mode = self.settings.get("apply_mode", "screen_pick")
-        if mode != "screen_pick" or not IS_WIN:
-            QGuiApplication.clipboard().setText(hx)
-            self._finish_apply(hx)
-            return
-        if self.link.set_color(hx):          # connected: no screen pick needed
-            self._finish_apply(hx)
-            return
-        try:
-            parse_combo(self.settings.get("pick_shortcut", ""))
-        except ValueError as exc:
-            QGuiApplication.clipboard().setText(hx)
-            self.notify("pick_shortcut is not valid (%s). Copied %s instead." % (exc, hx))
-            self._finish_apply(hx)
-            return
-        # only send the pick shortcut to a painting app: in any other program
-        # (browser, chat app, ...) the same keys can open dialogs or do harm
-        apps = [a.lower() for a in self.settings.get("pick_apps", []) if isinstance(a, str)]
-        exe = exe_name(self.target_hwnd).lower()
-        if apps and exe not in apps:
-            QGuiApplication.clipboard().setText(hx)
-            self.show_toast("Not Clip Studio: copied")
-            self._log("target %r not in pick_apps, copied instead" % exe)
-            self._finish_apply(hx)
-            return
-        self.applying = True
-        self._flash_on(hx)
-        QApplication.processEvents()
-        focus(self.target_hwnd)
-        # give Windows a frame or two to actually put the dot on screen
-        QTimer.singleShot(int(self.settings.get("flash_ms", 35)),
-                          lambda: self._step_shortcut(hx))
-
-    def _step_shortcut(self, hx):
-        self._flash_on(hx)
-        # remember CSP's windows, so we can spot its picker window opening
-        self._pid = window_pid(self.target_hwnd)
-        self._before = visible_windows_of(self._pid) if self._pid else set()
-        send_combo(self.settings["pick_shortcut"])
-        self._t0 = QDateTime.currentMSecsSinceEpoch()
-        QTimer.singleShot(15, lambda: self._wait_for_picker(hx))
-
-    def _wait_for_picker(self, hx):
-        """Click as soon as CSP's picker is up, instead of a fixed wait."""
-        waited = QDateTime.currentMSecsSinceEpoch() - self._t0
-        limit = int(self.settings.get("pick_delay_ms", 250))
-        opened = bool(self._pid) and bool(visible_windows_of(self._pid) - self._before)
-        # CSP's picker window shows up after ~65 ms but only takes clicks
-        # a little later, so never click before "picker_ready_ms"
-        ready = int(self.settings.get("picker_ready_ms", 150))
-        if (opened and waited >= ready) or waited >= max(limit, ready + 60):
-            self._log("picker %s, clicked after %d ms" % (
-                "seen" if opened else "NOT seen", waited))
-            self._step_click(hx)
-        else:
-            QTimer.singleShot(10, lambda: self._wait_for_picker(hx))
-
-    def _flash_on(self, hx):
-        """Put the color under the pen for CSP's screen picker to sample:
-        a tiny dot ("dot") or the whole panel ("panel")."""
-        if self.settings.get("flash_mode", "dot") == "panel":
-            self.flash = hx
-            set_topmost(int(self.winId()), True)
-            self.repaint()
-        else:
-            self.dot.show_at_cursor(hx)
-
-    def _log(self, msg):
-        if not self.settings.get("debug_log", False):
-            return
-        try:
-            with open(os.path.join(APP_DIR, "pick_log.txt"), "a", encoding="utf-8") as f:
-                f.write("%s  %s  target=%s\n" % (
-                    QDateTime.currentDateTime().toString("HH:mm:ss.zzz"), msg,
-                    self.target_hwnd))
-        except Exception:
-            pass
-
-    def _step_click(self, hx):
-        self._flash_on(hx)            # follow the pen if it moved meanwhile
-        QApplication.processEvents()
-        click("left")
-        self._log("left-click sent")
-        # CSP needs a moment to take the click before the closing right-click
-        QTimer.singleShot(int(self.settings.get("exit_delay_ms", 90)),
-                          lambda: self._step_exit(hx))
-
-    def _step_exit(self, hx):
-        self._log("right-click at %d ms" % (QDateTime.currentMSecsSinceEpoch() - self._t0))
-        if self.settings.get("right_click_to_exit_pick", True):
-            click("right")
-        after = self.settings.get("after_pick_shortcut", "")
-        if after:
-            QTimer.singleShot(30, lambda: send_combo(after))
-        QTimer.singleShot(40, lambda: self._finish_apply(hx))
+        if not self.link.set_color(hx):
+            self.show_toast("Not connected to Clip Studio", 2500)
+        self._finish_apply(hx)
 
     def _finish_apply(self, hx):
-        self.flash = None
-        self.applying = False
-        self.dot.hide()
-        if IS_WIN and not self.on_top:
-            set_topmost(int(self.winId()), False)
         self.applied_hex = hx
-        if self.settings.get("also_copy_hex") and self.settings.get("apply_mode") == "screen_pick":
+        if self.settings.get("also_copy_hex"):
             QGuiApplication.clipboard().setText(hx)
         if hx in self.history:
             self.history.remove(hx)
@@ -1631,18 +1428,11 @@ class LumaPicker(QWidget):
 
     # ------------------------------------------------------------------ input
     def mousePressEvent(self, e):
-        if self.applying:
-            return
         if e.button() == Qt.RightButton and HEX_RECT.contains(e.position().toPoint()):
             self.paste_hex()
             return
         if e.button() != Qt.LeftButton:
             return
-        if IS_WIN:
-            # the panel never takes focus, so the app in front is the one to paint in
-            fg = foreground()
-            if fg and int(fg) != int(self.winId()):
-                self.target_hwnd = fg
         p = e.position()
         pt = p.toPoint()
         if FIELD.contains(pt):
@@ -1651,6 +1441,8 @@ class LumaPicker(QWidget):
         elif SLIDER.adjusted(0, -4, 0, 4).contains(pt):
             self.dragging = "slider"
             self._drag_slider(p)
+        elif LINK_BTN.contains(pt) and not self.link.ready:
+            self.start_pairing()
         elif GREY_BTN.contains(pt):
             self.toggle_grey_panel()
         elif SCREEN_BTN.contains(pt):
@@ -1722,8 +1514,6 @@ class LumaPicker(QWidget):
                         return
 
     def mouseMoveEvent(self, e):
-        if self.applying:
-            return
         if self.move_offset is not None:
             self.move(e.globalPosition().toPoint() - self.move_offset)
             return
@@ -1731,7 +1521,7 @@ class LumaPicker(QWidget):
         over_btn = any(r.contains(pt) for r in (CLOSE_BTN, PIN_BTN, TOP_BTN, EYE_BTN, HEX_RECT,
                                                MODE_BTN, COPY_BTN, OLD_SW, NEW_SW, SHAPE_SQ,
                                                SHAPE_RD, MASK_PREV, MASK_NAME, MASK_NEXT,
-                                               GREY_BTN, SCREEN_BTN))
+                                               GREY_BTN, SCREEN_BTN, LINK_BTN))
         if not (self.dragging or e.buttons()):
             self._show_tip(pt, e.globalPosition().toPoint())
         want = (Qt.SizeAllCursor if pt.y() < HEADER_H and not over_btn
@@ -1746,7 +1536,7 @@ class LumaPicker(QWidget):
             self._drag_mask(e.position())
 
     def mouseReleaseEvent(self, e):
-        if self.applying or e.button() != Qt.LeftButton:
+        if e.button() != Qt.LeftButton:
             return
         if self.move_offset is not None:
             self.move_offset = None
@@ -1798,6 +1588,8 @@ class LumaPicker(QWidget):
         return (
             (HEX_RECT, "Hex code. Click to copy, right-click to paste one"),
             (COPY_BTN, "Copy the hex code"),
+            (LINK_BTN, "Connect to Clip Studio: click, then open File > Connect to "
+                       "smartphone in Clip Studio. Luma reads the QR code and pairs"),
             (MODE_BTN, "How value is measured. L: perceptual. Y: Clip Studio "
                        "luminance (grey Color-layer check). Click to switch"),
             (EYE_BTN, "Eyedropper: pick any color on screen (%s)"
@@ -1845,15 +1637,11 @@ class LumaPicker(QWidget):
         """Wheel over the field or bar: nudge the value; the color goes to
         Clip Studio once the wheel has been still for a moment."""
         pt = e.position().toPoint()
-        if self.applying or not (FIELD.contains(pt) or SLIDER.adjusted(0, -4, 0, 4).contains(pt)):
+        if not (FIELD.contains(pt) or SLIDER.adjusted(0, -4, 0, 4).contains(pt)):
             return
         notches = e.angleDelta().y() / 120.0
         if not notches:
             return
-        if IS_WIN:
-            fg = foreground()
-            if fg and int(fg) != int(self.winId()):
-                self.target_hwnd = fg
         self.set_value(self.value() + notches * float(self.settings.get("wheel_step", 0.01)))
         self.wheel_timer.start(int(self.settings.get("wheel_send_ms", 350)))
 
@@ -1885,9 +1673,6 @@ class LumaPicker(QWidget):
         return self._field_img, self._slider_img
 
     def paintEvent(self, _):
-        if self.flash:  # solid color the CSP screen picker samples
-            QPainter(self).fillRect(self.rect(), QColor(self.flash))
-            return
         if not self.settings.get("grey_panel", False):
             p = QPainter(self)
             p.setRenderHint(QPainter.Antialiasing)
@@ -1951,6 +1736,7 @@ class LumaPicker(QWidget):
         if not toast:
             draw_icon(COPY_BTN, "copy", DIM, 12)
         draw_icon(EYE_BTN, "eyedropper", TEXT)
+        self._paint_link(p)
 
         sw = QPainterPath()
         sw.addRoundedRect(QRectF(OLD_SW.united(NEW_SW)), 5, 5)
@@ -2308,7 +2094,6 @@ def main():
     menu.addAction("Open settings file", lambda: os.startfile(SETTINGS_PATH)
                    if IS_WIN else None)
     menu.addAction("Screen in greyscale on/off", picker.toggle_screen_grey)
-    menu.addAction("Connect to Clip Studio...", picker.start_pairing)
     menu.addSeparator()
     menu.addAction("Quit", app.quit)
     app.aboutToQuit.connect(lambda: set_screen_grey(False)

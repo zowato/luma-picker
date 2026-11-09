@@ -59,30 +59,17 @@ of an object's surroundings. Colors go straight into **Clip Studio Paint**.
 > SmartScreen warns about it. Click **More info → Run anyway**. You can check
 > the source and build it yourself (see below).
 
-## Set up Clip Studio Paint (once)
+## Connect to Clip Studio Paint (once)
 
-Luma Picker hands colors to Clip Studio through CSP's own screen picker:
+Luma Picker sets Clip Studio's drawing color directly, over Clip Studio's
+companion connection (the one its phone app uses).
 
-1. In Clip Studio Paint open **File → Shortcut Settings**.
-2. Choose **Menu commands → Edit → Pick screen color** (some versions call it
-   *Obtain screen color*).
-3. Click **Edit shortcut**, press **Ctrl+Alt+Shift+O** and click **OK**.
-
-That's it. When you pick a color in Luma Picker, Clip Studio's drawing color
-changes to match.
-
-### Faster: connect directly (optional)
-
-Luma can also set Clip Studio's color directly, without the screen pick. This
-works in screen greyscale mode too, and the mouse is never busy.
-
-1. Right-click Luma's tray icon and choose **Connect to Clip Studio...**
+1. Click **Connect** at the top of the Luma panel.
 2. In Clip Studio open **File → Connect to smartphone**. Luma reads the QR code
    off your screen and connects. You can close the QR window after that.
 
-Luma reconnects on its own each time. This uses Clip Studio's companion
-connection, which CELSYS hasn't documented, so a Clip Studio update could
-break it. If the connection is down, Luma falls back to the screen pick.
+Luma reconnects on its own every time both apps are running. Until it's
+connected, the panel shows a warning and picks don't reach Clip Studio.
 
 ## Using it
 
@@ -103,9 +90,10 @@ break it. If the connection is down, Luma falls back to the screen pick.
 | Click / right-click the **hex** | Copy it / paste a hex from the clipboard |
 | Drag the top bar | Move the panel (it stays there and stays open) |
 | Arrow-to-bar / pin / × (top right) | Stay in front of other windows / keep the panel open at its spot / hide |
+| **Connect** (top of the panel) | Connect to Clip Studio, see above |
 | Hover over any control | See what it does |
 | Half circle (next to Square/Round) | Show the panel in greyscale. The field turns one flat grey |
-| Half monitor, or **Ctrl+Alt+Shift+G** | Whole screen in greyscale to paint in values only. Press again for color. Picks and the eyedropper still get the real colors |
+| Half monitor, or **Ctrl+Alt+Shift+G** | Whole screen in greyscale to paint in values only. Press again for color. Picks still reach Clip Studio |
 
 Map the two hotkeys to keys on your macro pad (for example in Razer Synapse)
 for one-press access.
@@ -120,10 +108,7 @@ needed.
 |---|---|---|
 | `hotkey` | `ctrl+alt+shift+c` | Show or hide the panel |
 | `eyedropper_hotkey` | `ctrl+alt+shift+e` | Start the screen eyedropper (`""` to turn off) |
-| `pick_shortcut` | `ctrl+alt+shift+o` | Must match the shortcut you gave *Pick screen color* in Clip Studio |
-| `apply_mode` | `screen_pick` | `clipboard` only copies the hex instead of sending it to Clip Studio |
 | `hue_shift_strength` | `1.0` | How strongly shading shifts hue (0.5 subtle, 2 strong) |
-| `pick_apps` | `["CLIPStudioPaint.exe"]` | Programs that get the pick shortcut. In any other program Luma copies the hex instead. Add another painting app's .exe name, or use `[]` to send everywhere |
 | `greyscale_hotkey` | `ctrl+alt+shift+g` | Whole screen in greyscale on/off (`""` to turn off). Covers every monitor and uses the `luma_weights` grey |
 | `field_shape` | `square` | `round` shows the hue wheel |
 | `field_cells` | `24` | Color blocks per side of the square field (4 to 96) |
@@ -131,31 +116,25 @@ needed.
 | `value_mode` | `perceptual` | `luminance` keeps Clip Studio's grey-layer value instead of OKLab lightness |
 | `luma_weights` | `[0.30, 0.59, 0.11]` | R, G, B weights for `luminance`. Adjust if Clip Studio's grey check disagrees |
 | `wheel_step` / `wheel_send_ms` | `0.01` / `350` | Value change per wheel notch / pause before the color is sent |
-| `after_pick_shortcut` | `""` | A key to press after each pick, e.g. `"b"` to return to the brush |
-| `picker_ready_ms` | `150` | Wait before clicking in Clip Studio's picker. Raise if colors sometimes don't arrive |
-| `exit_delay_ms` | `90` | Pause before closing Clip Studio's picker |
-| `flash_mode` | `dot` | `panel` flashes the whole panel instead of a small dot (fallback) |
 | `auto_hide` / `auto_hide_distance` | `true` / `60` | Unpinned panel hides when the pen moves this far away |
 | `also_copy_hex` | `false` | Also copy each picked color's hex |
-| `debug_log` | `false` | Write timing info to `pick_log.txt` (for bug reports) |
 
 Keys can be letters, digits, `f1`–`f24`, `numpad0`–`numpad9`, `space`, `tab`,
 `insert`, `home`, … combined with `ctrl`, `alt`, `shift`, `win`.
 
 ## How it works (and limitations)
 
-- **Windows only** for now: the global hotkeys and the hand-off to Clip Studio
-  use the Windows API. On other systems it runs in clipboard mode.
-- To send a color, Luma briefly shows a 9-pixel dot of the color under your
-  pen, triggers Clip Studio's *Pick screen color* and clicks. The mouse is
-  busy for about a third of a second.
-- Other painting apps can work too if they have a "pick color from screen"
-  command with a shortcut. Otherwise use `apply_mode: clipboard`.
-- Tested with Clip Studio Paint on Windows.
+- **Windows only** for now: the global hotkeys and the greyscale screen use
+  the Windows API.
+- The connection to Clip Studio isn't documented by CELSYS. Luma follows the
+  public notes of the ok-picker-csp and clipremote projects, so a Clip Studio
+  update could break it.
+- Tested with Clip Studio Paint 5 on Windows.
 
 ## Privacy
 
-Luma Picker has no network access, accounts, telemetry or ads. The
+Luma Picker has no internet access, accounts, telemetry or ads. Its only
+connection goes to Clip Studio on your own PC (127.0.0.1). The
 eyedropper's screen grab happens only while you're picking and never leaves
 your PC. Settings and recent colors are stored in `%APPDATA%\LumaPicker\`.
 
