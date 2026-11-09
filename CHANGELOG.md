@@ -8,6 +8,8 @@
 - Warm orange accent instead of purple, new eyedropper/copy/pin icons, a clearer "stay in front" icon, and hover tooltips on every control
 - Masked hues are pushed darker when the picked value is light and lighter when it is dark, so the allowed hues stand out
 - **New square field**: blocks of color with hue left to right and pale (top) to strongest (bottom), all at one value. It replaces the old a/b plane view
+- **Greyscale panel** button: shows the whole panel by value, so the field turns one flat grey
+- **Greyscale screen** (button, tray menu, Ctrl+Alt+Shift+G): the whole desktop in greyscale for painting in values only. Picks still get the real colors
 - Mouse wheel over the field or bar nudges the value 1% per notch and sends the color when you stop
 - Fix: the pick shortcut is only sent to Clip Studio (`pick_apps`). Before, picking while another app was in front sent it Ctrl+Alt+Shift+O, which could open a file dialog
 
@@ -21,3 +23,4 @@
 - **Surroundings**: floor/cast shadow and bounce light suggestions based on the surface color
 - **Eyedropper** for any color on screen (button or hotkey), click the hex to copy it, right-click to paste one
 - Recent colors, settings file that reloads while the app runs
+

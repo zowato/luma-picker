@@ -45,6 +45,8 @@ SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
 DEFAULTS = {
     "hotkey": "ctrl+alt+shift+c",
     "eyedropper_hotkey": "ctrl+alt+shift+e",   # pick a color from the screen
+    "greyscale_hotkey": "ctrl+alt+shift+g",    # whole screen in greyscale on/off
+    "grey_panel": False,                       # show the panel itself in greyscale
     "apply_mode": "screen_pick",          # "screen_pick" or "clipboard"
     "pick_shortcut": "ctrl+alt+shift+o",  # CSP: Edit > Pick screen color
     "pick_apps": ["CLIPStudioPaint.exe"],  # send the shortcut only to these
@@ -551,6 +553,46 @@ def render_view(value, n, luma=False, shape="square", mask=None, cells=24):
     return _to_qimage(rgb, inside)
 
 
+def to_grey(rgb, luma):
+    """sRGB 0..1 (... x 3) -> grey of the same value: luminance, or OKLab L."""
+    if luma:
+        return luma_of_srgb(rgb[..., 0], rgb[..., 1], rgb[..., 2])
+    L = linear_to_oklab(*np.moveaxis(srgb_to_linear(rgb), -1, 0))[0]
+    return linear_to_srgb(np.clip(L, 0, 1) ** 3)       # OKLab grey: lin = L^3
+
+
+def grey_matrix(weights):
+    """5x5 color matrix (row = input channel) that turns the screen grey."""
+    m = np.eye(5, dtype=np.float32)
+    for i, w in enumerate(weights):
+        m[i, :3] = w
+    return m
+
+
+_mag = {}
+
+
+def set_screen_grey(on, weights=None):
+    """Whole desktop in greyscale (Windows Magnification API), or back to
+    normal. Screen pickers still read the real colors. False if unsupported."""
+    if not IS_WIN:
+        return False
+    try:
+        if "dll" not in _mag:
+            dll = ctypes.WinDLL("Magnification")
+            dll.MagInitialize.restype = ctypes.c_bool
+            dll.MagSetFullscreenColorEffect.restype = ctypes.c_bool
+            dll.MagSetFullscreenColorEffect.argtypes = (ctypes.c_void_p,)
+            if not dll.MagInitialize():
+                return False
+            _mag["dll"] = dll
+        m = grey_matrix(weights or LUMA_W) if on else np.eye(5, dtype=np.float32)
+        buf = (ctypes.c_float * 25)(*m.flatten().tolist())
+        return bool(_mag["dll"].MagSetFullscreenColorEffect(ctypes.byref(buf)))
+    except (OSError, AttributeError):
+        return False
+
+
 def render_slider_luma(a, b, w, h):
     Ys = (np.arange(w) + 0.5) / w
     L, aa, bb = luma_color(Ys, np.full(w, a), np.full(w, b))
@@ -745,8 +787,10 @@ HEADER_H = 44                      # drag the window by this top bar
 FIELD = QRect(PAD, 46, W - 2 * PAD, W - 2 * PAD)
 SLIDER = QRect(PAD, FIELD.bottom() + 11, W - 2 * PAD, 24)
 VIEW_Y = SLIDER.bottom() + 10                     # Square|Round  ·  mask
-SHAPE_SQ = QRect(PAD, VIEW_Y, 50, 18)
-SHAPE_RD = QRect(SHAPE_SQ.right() + 1, VIEW_Y, 50, 18)
+SHAPE_SQ = QRect(PAD, VIEW_Y, 46, 18)
+SHAPE_RD = QRect(SHAPE_SQ.right() + 1, VIEW_Y, 46, 18)
+GREY_BTN = QRect(SHAPE_RD.right() + 5, VIEW_Y, 18, 18)      # panel in greyscale
+SCREEN_BTN = QRect(GREY_BTN.right() + 3, VIEW_Y, 18, 18)    # screen in greyscale
 MASK_PREV = QRect(W - PAD - 124, VIEW_Y, 18, 18)
 MASK_NEXT = QRect(W - PAD - 18, VIEW_Y, 18, 18)
 MASK_NAME = QRect(MASK_PREV.right() + 1, VIEW_Y,
@@ -1095,6 +1139,21 @@ class LumaPicker(QWidget):
 
     def round_field(self):
         return self.settings.get("field_shape") == "round"
+
+    def toggle_grey_panel(self):
+        on = not self.settings.get("grey_panel", False)
+        self.settings["grey_panel"] = on
+        save_settings(self.settings)
+        self.show_toast("Panel in greyscale" if on else "Panel in color")
+
+    def toggle_screen_grey(self):
+        on = not getattr(self, "screen_grey", False)
+        if not set_screen_grey(on):
+            self.screen_grey = False
+            self.show_toast("Screen greyscale not available")
+            return
+        self.screen_grey = on
+        self.show_toast("Screen in greyscale" if on else "Screen in color")
 
     def set_shape(self, shape):
         self.settings["field_shape"] = shape
@@ -1482,6 +1541,10 @@ class LumaPicker(QWidget):
         elif SLIDER.adjusted(0, -4, 0, 4).contains(pt):
             self.dragging = "slider"
             self._drag_slider(p)
+        elif GREY_BTN.contains(pt):
+            self.toggle_grey_panel()
+        elif SCREEN_BTN.contains(pt):
+            self.toggle_screen_grey()
         elif SHAPE_SQ.contains(pt) or SHAPE_RD.contains(pt):
             self.set_shape("round" if SHAPE_RD.contains(pt) else "square")
         elif MASK_PREV.contains(pt):
@@ -1557,7 +1620,8 @@ class LumaPicker(QWidget):
         pt = e.position().toPoint()
         over_btn = any(r.contains(pt) for r in (CLOSE_BTN, PIN_BTN, TOP_BTN, EYE_BTN, HEX_RECT,
                                                MODE_BTN, COPY_BTN, OLD_SW, NEW_SW, SHAPE_SQ,
-                                               SHAPE_RD, MASK_PREV, MASK_NAME, MASK_NEXT))
+                                               SHAPE_RD, MASK_PREV, MASK_NAME, MASK_NEXT,
+                                               GREY_BTN, SCREEN_BTN))
         if not (self.dragging or e.buttons()):
             self._show_tip(pt, e.globalPosition().toPoint())
         want = (Qt.SizeAllCursor if pt.y() < HEADER_H and not over_btn
@@ -1637,6 +1701,11 @@ class LumaPicker(QWidget):
             (SLIDER, "Value. Drag, or use the mouse wheel for 1% steps"),
             (SHAPE_SQ, "Square field: hue left to right, pale to strong top to bottom"),
             (SHAPE_RD, "Round wheel: hue around the circle, strongest at the edge"),
+            (GREY_BTN, "Show this panel in greyscale: the field turns one flat grey "
+                       "because every color in it has the same value"),
+            (SCREEN_BTN, "Whole screen in greyscale (%s): paint in values only. "
+                         "Picked colors stay real colors"
+             % (self.settings.get("greyscale_hotkey", "") or "no hotkey")),
             (MASK_NAME.united(MASK_PREV).united(MASK_NEXT),
              "Gamut mask: only some hues can be picked. Click to change"),
             (ROT_SL, "Turn the mask"),
@@ -1706,12 +1775,31 @@ class LumaPicker(QWidget):
         return self._field_img, self._slider_img
 
     def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
         if self.flash:  # solid color the CSP screen picker samples
-            p.fillRect(self.rect(), QColor(self.flash))
+            QPainter(self).fillRect(self.rect(), QColor(self.flash))
             return
+        if not self.settings.get("grey_panel", False):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.Antialiasing)
+            self._paint(p)
+            return
+        # greyscale: paint off-screen, then turn every pixel into the grey of
+        # its value (the field becomes one flat grey: proof it's one value)
+        dpr = self.devicePixelRatioF()
+        img = QImage(int(W * dpr), int(H * dpr), QImage.Format_RGBA8888)
+        img.fill(Qt.transparent)
+        img.setDevicePixelRatio(dpr)
+        q = QPainter(img)
+        q.setRenderHint(QPainter.Antialiasing)
+        self._paint(q)
+        q.end()
+        arr = np.frombuffer(img.bits(), np.uint8).reshape(
+            img.height(), img.bytesPerLine() // 4, 4)[:, :img.width()]
+        g = np.round(to_grey(arr[..., :3] / 255.0, self.luma_mode()) * 255)
+        arr[..., :3] = np.clip(g, 0, 255).astype(np.uint8)[..., None]
+        QPainter(self).drawImage(0, 0, img)
 
+    def _paint(self, p):
         panel = QPainterPath()
         panel.addRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 14, 14)
         p.fillPath(panel, QColor(BG))
@@ -1837,6 +1925,37 @@ class LumaPicker(QWidget):
         for rect, label, on in ((SHAPE_SQ, "Square", not rnd), (SHAPE_RD, "Round", rnd)):
             p.setPen(QColor(TEXT if on else DIM))
             p.drawText(QRectF(rect), Qt.AlignCenter, label)
+
+        # greyscale buttons: half-filled circle (panel), half-filled monitor (screen)
+        for rect, on in ((GREY_BTN, self.settings.get("grey_panel", False)),
+                         (SCREEN_BTN, getattr(self, "screen_grey", False))):
+            r = QRectF(rect)
+            if on:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(ACTIVE))
+                p.drawRoundedRect(r, 5, 5)
+            col = QColor(BORDER if on else DIM)
+            if rect is GREY_BTN:
+                shape = QRectF(r.center().x() - 5.5, r.center().y() - 5.5, 12, 12)
+            else:
+                shape = QRectF(r.left() + 3, r.top() + 3, 13, 9)
+                p.setPen(QPen(col, 1.4))
+                p.drawLine(QPointF(r.center().x() + 0.5, shape.bottom()),
+                           QPointF(r.center().x() + 0.5, r.bottom() - 3))
+                p.drawLine(QPointF(r.center().x() - 3, r.bottom() - 3),
+                           QPointF(r.center().x() + 4, r.bottom() - 3))
+            half = QPainterPath()
+            if rect is GREY_BTN:
+                half.addEllipse(shape)
+            else:
+                half.addRoundedRect(shape, 1.5, 1.5)
+            p.save()
+            p.setClipRect(QRectF(shape.left(), shape.top(), shape.width() / 2, shape.height()))
+            p.fillPath(half, col)
+            p.restore()
+            p.setPen(QPen(col, 1.4))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(half)
 
         mask = self.mask()
         p.setPen(QColor(DIM))
@@ -2078,8 +2197,11 @@ def main():
     menu.addAction("Show palette", picker.show_centered)
     menu.addAction("Open settings file", lambda: os.startfile(SETTINGS_PATH)
                    if IS_WIN else None)
+    menu.addAction("Screen in greyscale on/off", picker.toggle_screen_grey)
     menu.addSeparator()
     menu.addAction("Quit", app.quit)
+    app.aboutToQuit.connect(lambda: set_screen_grey(False)
+                            if getattr(picker, "screen_grey", False) else None)
     tray.setContextMenu(menu)
     tray.activated.connect(lambda r: picker.show_centered()
                            if r == QSystemTrayIcon.Trigger else None)
@@ -2087,14 +2209,17 @@ def main():
 
     if IS_WIN:
         hk = HotkeyWindow()
-        hk.triggered.connect(lambda i: picker.toggle() if i == 1
-                             else picker.start_eyedropper("main"))
-        try:
-            eh = settings.get("eyedropper_hotkey", "")
-            if eh and not hk.register(eh, 2):
-                notify("Could not register eyedropper key %s." % eh)
-        except ValueError as exc:
-            notify("eyedropper_hotkey is not valid: %s" % exc)
+        actions = {1: picker.toggle, 2: lambda: picker.start_eyedropper("main"),
+                   3: picker.toggle_screen_grey}
+        hk.triggered.connect(lambda i: actions.get(i, lambda: None)())
+        for key, hk_id, what in (("eyedropper_hotkey", 2, "eyedropper"),
+                                 ("greyscale_hotkey", 3, "greyscale")):
+            try:
+                eh = settings.get(key, "")
+                if eh and not hk.register(eh, hk_id):
+                    notify("Could not register %s key %s." % (what, eh))
+            except ValueError as exc:
+                notify("%s is not valid: %s" % (key, exc))
         try:
             if hk.register(settings["hotkey"]):
                 notify("Running. Press %s to open the palette." % settings["hotkey"])

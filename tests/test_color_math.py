@@ -172,3 +172,18 @@ def test_mask_grey_contrasts_with_value(value, darker):
 @pytest.mark.parametrize("name", ["eyedropper", "copy", "pin"])
 def test_icons_ship_with_the_app(name):
     assert os.path.isfile(os.path.join(lp.ICON_DIR, name + ".png"))
+
+
+@pytest.mark.parametrize("luma", [False, True])
+def test_grey_panel_turns_one_value_field_flat(luma):
+    v = 0.6
+    img = lp.render_view(v, 40, luma, "square", None)
+    arr = np.frombuffer(img.constBits(), np.uint8).reshape(40, 40, 4)[..., :3] / 255.0
+    g = lp.to_grey(arr, luma)
+    assert g.max() - g.min() < 0.02            # the whole field is one grey
+
+
+def test_grey_matrix_rows_are_weights():
+    m = lp.grey_matrix((0.3, 0.59, 0.11))
+    assert np.allclose(m[:3, :3], [[0.3] * 3, [0.59] * 3, [0.11] * 3])
+    assert np.allclose(m[3:, 3:], np.eye(2))

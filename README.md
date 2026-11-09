@@ -91,6 +91,8 @@ changes to match.
 | Drag the top bar | Move the panel (it stays there and stays open) |
 | Arrow-to-bar / pin / × (top right) | Stay in front of other windows / keep the panel open at its spot / hide |
 | Hover over any control | See what it does |
+| Half circle (next to Square/Round) | Show the panel in greyscale. The field turns one flat grey |
+| Half monitor, or **Ctrl+Alt+Shift+G** | Whole screen in greyscale to paint in values only. Press again for color |
 
 Map the two hotkeys to keys on your macro pad (for example in Razer Synapse)
 for one-press access.
@@ -109,6 +111,7 @@ needed.
 | `apply_mode` | `screen_pick` | `clipboard` only copies the hex instead of sending it to Clip Studio |
 | `hue_shift_strength` | `1.0` | How strongly shading shifts hue (0.5 subtle, 2 strong) |
 | `pick_apps` | `["CLIPStudioPaint.exe"]` | Programs that get the pick shortcut. In any other program Luma copies the hex instead. Add another painting app's .exe name, or use `[]` to send everywhere |
+| `greyscale_hotkey` | `ctrl+alt+shift+g` | Whole screen in greyscale on/off (`""` to turn off). Covers every monitor and uses the `luma_weights` grey |
 | `field_shape` | `square` | `round` shows the hue wheel |
 | `field_cells` | `24` | Color blocks per side of the square field (4 to 96) |
 | `mask` / `mask_rotate` / `mask_width` | `0` / `0` / `60` | Gamut mask (0 off, 1 analogous, 2 complementary, 3 split, 4 triad), its turn and sector width in degrees |
