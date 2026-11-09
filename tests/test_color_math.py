@@ -187,3 +187,29 @@ def test_grey_matrix_rows_are_weights():
     m = lp.grey_matrix((0.3, 0.59, 0.11))
     assert np.allclose(m[:3, :3], [[0.3] * 3, [0.59] * 3, [0.11] * 3])
     assert np.allclose(m[3:, 3:], np.eye(2))
+
+
+# ---- direct Clip Studio link (companion protocol)
+import csp_link as cl  # noqa: E402
+
+
+def test_qr_decodes():
+    s = cl._xor("127.0.0.1,192.168.1.5\t32035\tpw123\tG#1:2022.12".encode(), cl.QR_KEY).hex()
+    qr = cl.decode_qr("https://companion.clip-studio.com/rc/en-us?s=" + s)
+    assert qr == {"ips": ["127.0.0.1", "192.168.1.5"], "port": 32035,
+                  "password": "pw123", "generation": "G#1:2022.12"}
+    assert cl.decode_qr("https://evil.example.com/rc?s=" + s) is None
+    assert cl.decode_qr("not a url") is None
+
+
+def test_frame_round_trip():
+    raw = cl.frame(1, "SetCurrentColor", 7, {"RGBColorR": 18})
+    assert raw.endswith(b"\x1e\x00") and raw[0] == 1
+    assert cl.parse_frame(raw[:-1]) == (1, "SetCurrentColor", 7, {"RGBColorR": 18})
+    assert cl.parse_frame(cl.frame(6, "TellHeartbeat", 2, "")[:-1])[3] is None
+
+
+def test_auth_detail_xors_secrets():
+    d = cl.auth_detail("G#1:2022.12", "ab", "cd")
+    assert d[0] == "G#1:2022.12"
+    assert bytes.fromhex(d[1]) == bytes([ord("a") ^ 0xB6, ord("b") ^ 0xD5])

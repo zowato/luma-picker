@@ -24,6 +24,7 @@ import os
 import sys
 
 import numpy as np
+from csp_link import CspLink, decode_qr, find_qr_url
 from PySide6.QtCore import QDateTime, QObject, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QConicalGradient, QCursor, QFont,
                            QGuiApplication, QIcon, QImage, QPainter,
@@ -1107,6 +1108,12 @@ class LumaPicker(QWidget):
         self.pending = None         # swatch pressed, sent when the pen lifts
         self.sampler = ScreenSampler()
         self.sampler.picked.connect(self._on_sampled)
+        # direct link to Clip Studio's companion connection (no screen reading)
+        self.link = CspLink(settings.setdefault("csp_link", {}),
+                            lambda: save_settings(self.settings))
+        self.link.state.connect(self._on_link)
+        self.pair_timer = QTimer(self, interval=700, timeout=self._look_for_qr)
+        self.link.connect_saved()
         self.sample_target = "surface"
         self.toast = None           # (text, until_ms) short message in the header
         self._field_img = self._slider_img = None
@@ -1342,6 +1349,34 @@ class LumaPicker(QWidget):
         save_settings(self.settings)
         self.update()
 
+    def start_pairing(self):
+        """Wait for Clip Studio's pairing QR code on screen, then connect."""
+        self.pair_left = 90                       # about one minute
+        self.pair_timer.start()
+        self.notify("In Clip Studio open File > Connect to smartphone. "
+                    "Luma reads the QR code from the screen.")
+
+    def _look_for_qr(self):
+        self.pair_left -= 1
+        if self.pair_left <= 0:
+            self.pair_timer.stop()
+            self.notify("No Clip Studio QR code found. Try Connect to Clip Studio again.")
+            return
+        for scr in QGuiApplication.screens():
+            qr = decode_qr(find_qr_url(scr.grabWindow(0).toImage()) or "")
+            if qr:
+                self.pair_timer.stop()
+                self.link.pair(qr)
+                return
+
+    def _on_link(self, state):
+        if state == "paired":
+            self.notify("Connected to Clip Studio. You can close its QR window.")
+        elif state.startswith("failed:"):
+            self.notify("Clip Studio refused the connection (%s). Try Connect to "
+                        "Clip Studio again." % state[7:])
+        self.update()
+
     def start_eyedropper(self, target="main"):
         self.sample_target = target
         self.sampler.start()
@@ -1483,6 +1518,9 @@ class LumaPicker(QWidget):
         mode = self.settings.get("apply_mode", "screen_pick")
         if mode != "screen_pick" or not IS_WIN:
             QGuiApplication.clipboard().setText(hx)
+            self._finish_apply(hx)
+            return
+        if self.link.set_color(hx):          # connected: no screen pick needed
             self._finish_apply(hx)
             return
         try:
@@ -2251,7 +2289,7 @@ def main():
             with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
                 fresh = json.load(f)
             for k, v in fresh.items():
-                if k not in ("history", "last_color", "window_pos"):
+                if k not in ("history", "last_color", "window_pos", "csp_link"):
                     settings[k] = v
             apply_luma_weights(settings)
             picker.update()
@@ -2270,6 +2308,7 @@ def main():
     menu.addAction("Open settings file", lambda: os.startfile(SETTINGS_PATH)
                    if IS_WIN else None)
     menu.addAction("Screen in greyscale on/off", picker.toggle_screen_grey)
+    menu.addAction("Connect to Clip Studio...", picker.start_pairing)
     menu.addSeparator()
     menu.addAction("Quit", app.quit)
     app.aboutToQuit.connect(lambda: set_screen_grey(False)

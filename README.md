@@ -71,6 +71,19 @@ Luma Picker hands colors to Clip Studio through CSP's own screen picker:
 That's it. When you pick a color in Luma Picker, Clip Studio's drawing color
 changes to match.
 
+### Faster: connect directly (optional)
+
+Luma can also set Clip Studio's color directly, without the screen pick. This
+works in screen greyscale mode too, and the mouse is never busy.
+
+1. Right-click Luma's tray icon and choose **Connect to Clip Studio...**
+2. In Clip Studio open **File → Connect to smartphone**. Luma reads the QR code
+   off your screen and connects. You can close the QR window after that.
+
+Luma reconnects on its own each time. This uses Clip Studio's companion
+connection, which CELSYS hasn't documented, so a Clip Studio update could
+break it. If the connection is down, Luma falls back to the screen pick.
+
 ## Using it
 
 | Do this | To |
@@ -151,7 +164,7 @@ your PC. Settings and recent colors are stored in `%APPDATA%\LumaPicker\`.
 You need [Python 3.10+](https://www.python.org/downloads/) with *"Add
 python.exe to PATH"* ticked.
 
-- **Run:** double-click `run.bat`. It installs `PySide6` and `numpy` the
+- **Run:** double-click `run.bat`. It installs `PySide6`, `numpy` and `zxing-cpp` the
   first time.
 - **Build the .exe:** double-click `build.bat`. It runs the tests, builds
   `dist\Luma Picker\Luma Picker.exe` and can add a desktop shortcut.
