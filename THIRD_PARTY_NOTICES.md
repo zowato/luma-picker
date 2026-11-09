@@ -8,6 +8,7 @@ also contains the following software, each under its own license.
 | [Qt for Python (PySide6)](https://www.qt.io/qt-for-python) and the Qt 6 libraries | Window, drawing, tray icon | [LGPL v3](https://www.gnu.org/licenses/lgpl-3.0.html) |
 | [NumPy](https://numpy.org) | Color math | [BSD 3-Clause](https://github.com/numpy/numpy/blob/main/LICENSE.txt) |
 | [Python](https://www.python.org) | Runtime | [PSF License](https://docs.python.org/3/license.html) |
+| Icons in `assets/icons` (eyedropper, copy, pin) | Header buttons | Source and license still to be confirmed before release |
 | [PyInstaller](https://pyinstaller.org) bootloader | Turns the script into an .exe | GPL v2 with the PyInstaller bootloader exception (allows distributing apps built with it under any license) |
 
 ## About the Qt / LGPL v3 libraries

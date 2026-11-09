@@ -28,7 +28,7 @@ from PySide6.QtCore import QDateTime, QObject, QPointF, QRect, QRectF, Qt, QTime
 from PySide6.QtGui import (QColor, QConicalGradient, QCursor, QFont,
                            QGuiApplication, QIcon, QImage, QPainter,
                            QPainterPath, QPen, QPixmap)
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QToolTip, QWidget
 
 IS_WIN = sys.platform == "win32"
 
@@ -543,8 +543,11 @@ def render_view(value, n, luma=False, shape="square", mask=None, cells=24):
     rgb[~ok] = grey
     if mask and mask[0]:
         hue = np.degrees(np.arctan2(B, A)) % 360.0
-        off = ok & ~mask_allows(hue, *mask) & (np.hypot(A, B) >= MASK_GREY_C)
-        rgb[off] = grey + (rgb[off] - grey) * 0.22       # visible, but dull
+        off = ok & ~mask_allows(hue, *mask)
+        dull = grey + (rgb[off] - grey) * 0.22            # visible, but dull
+        # and pushed away from the picked value so the allowed hues stand out:
+        # darker when the value is light, lighter when it is dark
+        rgb[off] = dull * 0.62 if value >= 0.5 else dull + (1 - dull) * 0.38
     return _to_qimage(rgb, inside)
 
 
@@ -800,14 +803,45 @@ def harm_rect(i, n):
 CLOSE_BTN = QRect(W - PAD - 20, 12, 20, 20)
 PIN_BTN = QRect(CLOSE_BTN.left() - 24, 12, 20, 20)
 TOP_BTN = QRect(PIN_BTN.left() - 24, 12, 20, 20)
-NEW_SW = QRect(TOP_BTN.left() - 8 - 28, 13, 28, 18)
-OLD_SW = QRect(NEW_SW.left() - 28, 13, 28, 18)
-EYE_BTN = QRect(OLD_SW.left() - 26, 12, 20, 20)            # eyedropper
+NEW_SW = QRect(TOP_BTN.left() - 8 - 22, 13, 22, 18)
+OLD_SW = QRect(NEW_SW.left() - 22, 13, 22, 18)
+EYE_BTN = QRect(OLD_SW.left() - 24, 12, 20, 20)            # eyedropper
 TOAST_RECT = QRect(PAD + 2, 12, EYE_BTN.left() - PAD - 6, 20)
-HEX_RECT = QRect(PAD + 2, 12, 60, 20)                       # click = copy
-MODE_BTN = QRect(HEX_RECT.right() + 2, 13, EYE_BTN.left() - HEX_RECT.right() - 8, 18)
+HEX_RECT = QRect(PAD + 2, 12, 58, 20)                       # click = copy
+COPY_BTN = QRect(HEX_RECT.right() + 1, 12, 18, 20)
+MODE_BTN = QRect(COPY_BTN.right() + 3, 13, EYE_BTN.left() - COPY_BTN.right() - 7, 18)
 
-BG, BORDER, TEXT, DIM = "#1c1c22", "#5b4bd1", "#d8d8e4", "#7d7d8c"
+# warm orange accent; ACTIVE = background of a switched-on button
+BG, BORDER, TEXT, DIM = "#1c1c22", "#e8963a", "#d8d8e4", "#7d7d8c"
+ACTIVE = "#3d2e1c"
+
+if getattr(sys, "frozen", False):
+    ICON_DIR = os.path.join(getattr(sys, "_MEIPASS", ""), "assets", "icons")
+else:
+    ICON_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "assets", "icons")
+_icon_cache = {}
+
+
+def icon(name, color, size, dpr=1.0):
+    """assets/icons/<name>.png (black on transparent) tinted in color."""
+    key = (name, color, size, dpr)
+    if key not in _icon_cache:
+        src = QPixmap(os.path.join(ICON_DIR, name + ".png"))
+        pm = None
+        if not src.isNull():
+            px = int(round(size * dpr))
+            pm = QPixmap(px, px)
+            pm.fill(Qt.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.drawPixmap(pm.rect(), src)
+            p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+            p.fillRect(pm.rect(), QColor(color))
+            p.end()
+            pm.setDevicePixelRatio(dpr)
+        _icon_cache[key] = pm
+    return _icon_cache[key]
 
 
 def hist_rect(i):
@@ -1470,6 +1504,8 @@ class LumaPicker(QWidget):
             self.start_eyedropper("main")
         elif MODE_BTN.contains(pt):
             self.toggle_value_mode()
+        elif COPY_BTN.contains(pt):
+            self.copy_hex()
         elif HEX_RECT.contains(pt):
             self.copy_hex()
         elif pt.y() < HEADER_H:
@@ -1520,8 +1556,10 @@ class LumaPicker(QWidget):
             return
         pt = e.position().toPoint()
         over_btn = any(r.contains(pt) for r in (CLOSE_BTN, PIN_BTN, TOP_BTN, EYE_BTN, HEX_RECT,
-                                               MODE_BTN, OLD_SW, NEW_SW, SHAPE_SQ, SHAPE_RD,
-                                               MASK_PREV, MASK_NAME, MASK_NEXT))
+                                               MODE_BTN, COPY_BTN, OLD_SW, NEW_SW, SHAPE_SQ,
+                                               SHAPE_RD, MASK_PREV, MASK_NAME, MASK_NEXT))
+        if not (self.dragging or e.buttons()):
+            self._show_tip(pt, e.globalPosition().toPoint())
         want = (Qt.SizeAllCursor if pt.y() < HEADER_H and not over_btn
                 else Qt.PointingHandCursor if over_btn else Qt.ArrowCursor)
         if self.cursor().shape() != want:
@@ -1580,6 +1618,46 @@ class LumaPicker(QWidget):
         if not self.luma_mode():
             self.Y = luma_of_hex(self.current_hex())   # ready if the mode flips
         self.update()
+
+    def _tips(self):
+        on = lambda v: "on" if v else "off"    # noqa: E731
+        return (
+            (HEX_RECT, "Hex code. Click to copy, right-click to paste one"),
+            (COPY_BTN, "Copy the hex code"),
+            (MODE_BTN, "How value is measured. L: perceptual. Y: Clip Studio "
+                       "luminance (grey Color-layer check). Click to switch"),
+            (EYE_BTN, "Eyedropper: pick any color on screen (%s)"
+             % self.settings.get("eyedropper_hotkey", "")),
+            (OLD_SW, "Last color sent. Click to go back to it"),
+            (NEW_SW, "Current color"),
+            (TOP_BTN, "Stay in front of other windows (%s)" % on(self.on_top)),
+            (PIN_BTN, "Pin: keep the panel open at this spot (%s). Unpinned, it "
+                      "hides when the pen moves away" % on(self.pinned)),
+            (CLOSE_BTN, "Hide (%s shows it again)" % self.settings.get("hotkey", "")),
+            (SLIDER, "Value. Drag, or use the mouse wheel for 1% steps"),
+            (SHAPE_SQ, "Square field: hue left to right, pale to strong top to bottom"),
+            (SHAPE_RD, "Round wheel: hue around the circle, strongest at the edge"),
+            (MASK_NAME.united(MASK_PREV).united(MASK_NEXT),
+             "Gamut mask: only some hues can be picked. Click to change"),
+            (ROT_SL, "Turn the mask"),
+            (WID_SL, "How wide each allowed hue sector is"),
+            (JUMP_BTN, "On: picking a shade moves the field to it. Off: the rows stay put"),
+            (SURF_PICK, "Pick the floor or background color from the screen"),
+            (SURF_CUR, "Use the current color as the floor or background"),
+        )
+
+    def _show_tip(self, pt, gpos):
+        tip = next((t for r, t in self._tips() if r.contains(pt)), "")
+        if tip != getattr(self, "_tip", ""):
+            self._tip = tip
+            if tip:
+                QToolTip.showText(gpos, tip, self)
+            else:
+                QToolTip.hideText()
+
+    def leaveEvent(self, _):
+        self._tip = ""
+        QToolTip.hideText()
 
     def _drag_slider(self, p):
         self.set_value((p.x() - SLIDER.left()) / SLIDER.width())
@@ -1656,7 +1734,7 @@ class LumaPicker(QWidget):
             luma = self.luma_mode()
             mr = QRectF(MODE_BTN)
             p.setPen(QPen(QColor(BORDER if luma else "#3a3a46"), 1))
-            p.setBrush(QColor("#2e2a4a") if luma else Qt.NoBrush)
+            p.setBrush(QColor(ACTIVE) if luma else Qt.NoBrush)
             p.drawRoundedRect(mr, 9, 9)
             p.setBrush(Qt.NoBrush)
             p.setFont(QFont("Segoe UI", 8))
@@ -1665,13 +1743,16 @@ class LumaPicker(QWidget):
                        % round(self.value() * 100))
         font.setBold(False)
         p.setFont(font)
-        # eyedropper icon
-        e_ = QRectF(EYE_BTN)
-        p.setPen(QPen(QColor(TEXT), 1.6, Qt.SolidLine, Qt.RoundCap))
-        p.drawLine(QPointF(e_.left() + 5, e_.bottom() - 5), QPointF(e_.right() - 8, e_.top() + 8))
-        p.setBrush(QColor(TEXT))
-        p.drawEllipse(QPointF(e_.right() - 6.5, e_.top() + 6.5), 3.2, 3.2)
-        p.setBrush(Qt.NoBrush)
+        dpr = self.devicePixelRatioF()
+
+        def draw_icon(rect, name, color, size=14):
+            pm = icon(name, color, size, dpr)
+            if pm:
+                p.drawPixmap(QPointF(rect.center().x() + 0.5 - size / 2,
+                                     rect.center().y() + 0.5 - size / 2), pm)
+        if not toast:
+            draw_icon(COPY_BTN, "copy", DIM, 12)
+        draw_icon(EYE_BTN, "eyedropper", TEXT)
 
         sw = QPainterPath()
         sw.addRoundedRect(QRectF(OLD_SW.united(NEW_SW)), 5, 5)
@@ -1688,17 +1769,18 @@ class LumaPicker(QWidget):
         for btn, active in ((TOP_BTN, self.on_top), (PIN_BTN, self.pinned)):
             if active:
                 p.setPen(Qt.NoPen)
-                p.setBrush(QColor("#2e2a4a"))
+                p.setBrush(QColor(ACTIVE))
                 p.drawRoundedRect(QRectF(btn), 5, 5)
+        # stay on top: an arrow pushing up to a bar ("always in front")
         t = QRectF(TOP_BTN)
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(QColor(TEXT if self.on_top else DIM), 1.4))
-        p.drawRoundedRect(QRectF(t.left() + 4, t.top() + 4, 9, 9), 2, 2)
-        p.setBrush(QColor(BORDER) if self.on_top else QColor(BG))
-        p.drawRoundedRect(QRectF(t.left() + 8, t.top() + 8, 9, 9), 2, 2)
-        p.setPen(QPen(QColor(TEXT if self.pinned else DIM), 1.6))
-        p.setBrush(QColor(BORDER) if self.pinned else Qt.NoBrush)
-        p.drawEllipse(QRectF(PIN_BTN).adjusted(5, 5, -5, -5))
+        p.setPen(QPen(QColor(BORDER if self.on_top else DIM), 1.6, Qt.SolidLine, Qt.RoundCap))
+        cx_ = t.center().x() + 0.5
+        p.drawLine(QPointF(t.left() + 5, t.top() + 5), QPointF(t.right() - 4, t.top() + 5))
+        p.drawLine(QPointF(cx_, t.top() + 8), QPointF(cx_, t.bottom() - 4))
+        p.drawLine(QPointF(cx_ - 3.5, t.top() + 11.5), QPointF(cx_, t.top() + 8))
+        p.drawLine(QPointF(cx_ + 3.5, t.top() + 11.5), QPointF(cx_, t.top() + 8))
+        draw_icon(PIN_BTN, "pin", BORDER if self.pinned else DIM, 17)
         p.setPen(QPen(QColor(DIM), 1.6))
         c = QRectF(CLOSE_BTN).adjusted(6, 6, -6, -6)
         p.drawLine(c.topLeft(), c.bottomRight())
@@ -1750,7 +1832,7 @@ class LumaPicker(QWidget):
         p.drawPath(seg)
         p.save()
         p.setClipPath(seg)
-        p.fillRect(SHAPE_RD if rnd else SHAPE_SQ, QColor("#2e2a4a"))
+        p.fillRect(SHAPE_RD if rnd else SHAPE_SQ, QColor(ACTIVE))
         p.restore()
         for rect, label, on in ((SHAPE_SQ, "Square", not rnd), (SHAPE_RD, "Round", rnd)):
             p.setPen(QColor(TEXT if on else DIM))
@@ -1816,7 +1898,7 @@ class LumaPicker(QWidget):
         jump = bool(self.settings.get("jump_to_picked", True))
         jr = QRectF(JUMP_BTN)
         p.setPen(QPen(QColor(BORDER if jump else "#3a3a46"), 1))
-        p.setBrush(QColor("#2e2a4a") if jump else Qt.NoBrush)
+        p.setBrush(QColor(ACTIVE) if jump else Qt.NoBrush)
         p.drawRoundedRect(jr, 9, 9)
         p.setFont(small)
         p.setPen(QColor(TEXT if jump else DIM))

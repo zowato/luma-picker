@@ -154,3 +154,21 @@ def test_mask_allows_and_snaps():
     assert lp.mask_snap(160, (0,), 0, 40) == 20     # 140° to 20, 180° to 340
     assert lp.mask_snap(200, (0,), 0, 40) == 340
     assert lp.mask_allows(123, (), 0, 40)            # mask off
+
+
+def _mean_luma(img):
+    arr = np.frombuffer(img.constBits(), np.uint8).reshape(img.height(), img.width(), 4)
+    return float(lp.luma_of_srgb(*(arr[..., :3].reshape(-1, 3).T / 255.0)).mean())
+
+
+@pytest.mark.parametrize("value, darker", [(0.85, True), (0.2, False)])
+def test_mask_grey_contrasts_with_value(value, darker):
+    m = ((0, 120, 240), 0, 40)
+    plain = _mean_luma(lp.render_view(value, 48, False, "square", None))
+    masked = _mean_luma(lp.render_view(value, 48, False, "square", m))
+    assert (masked < plain - 0.05) if darker else (masked > plain + 0.05)
+
+
+@pytest.mark.parametrize("name", ["eyedropper", "copy", "pin"])
+def test_icons_ship_with_the_app(name):
+    assert os.path.isfile(os.path.join(lp.ICON_DIR, name + ".png"))

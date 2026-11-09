@@ -89,7 +89,8 @@ changes to match.
 | **Pick / Current** (Surroundings) | Set the surface color from the screen or from the current color |
 | Click / right-click the **hex** | Copy it / paste a hex from the clipboard |
 | Drag the top bar | Move the panel (it stays there and stays open) |
-| Two squares / circle / × (top right) | Stay on top / pin / close |
+| Arrow-to-bar / pin / × (top right) | Stay in front of other windows / keep the panel open at its spot / hide |
+| Hover over any control | See what it does |
 
 Map the two hotkeys to keys on your macro pad (for example in Razer Synapse)
 for one-press access.

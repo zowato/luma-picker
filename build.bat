@@ -13,6 +13,7 @@ if errorlevel 1 goto fail
 echo Building...
 python -m PyInstaller --noconfirm --clean --windowed --onedir ^
   --name "Luma Picker" --icon assets\icon.ico ^
+  --add-data "assets\icons;assets\icons" ^
   --distpath dist --workpath build src\luma_picker.py
 if errorlevel 1 goto fail
 
