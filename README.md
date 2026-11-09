@@ -96,6 +96,7 @@ needed.
 | `pick_shortcut` | `ctrl+alt+shift+o` | Must match the shortcut you gave *Pick screen color* in Clip Studio |
 | `apply_mode` | `screen_pick` | `clipboard` only copies the hex instead of sending it to Clip Studio |
 | `hue_shift_strength` | `1.0` | How strongly shading shifts hue (0.5 subtle, 2 strong) |
+| `pick_apps` | `["CLIPStudioPaint.exe"]` | Programs that get the pick shortcut. In any other program Luma copies the hex instead. Add another painting app's .exe name, or use `[]` to send everywhere |
 | `value_mode` | `perceptual` | `luminance` keeps Clip Studio's grey-layer value instead of OKLab lightness |
 | `luma_weights` | `[0.30, 0.59, 0.11]` | R, G, B weights for `luminance`. Adjust if Clip Studio's grey check disagrees |
 | `wheel_step` / `wheel_send_ms` | `0.01` / `350` | Value change per wheel notch / pause before the color is sent |

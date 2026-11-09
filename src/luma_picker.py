@@ -47,6 +47,7 @@ DEFAULTS = {
     "eyedropper_hotkey": "ctrl+alt+shift+e",   # pick a color from the screen
     "apply_mode": "screen_pick",          # "screen_pick" or "clipboard"
     "pick_shortcut": "ctrl+alt+shift+o",  # CSP: Edit > Pick screen color
+    "pick_apps": ["CLIPStudioPaint.exe"],  # send the shortcut only to these
     "pick_delay_ms": 250,          # longest wait for CSP's picker window
     "exit_delay_ms": 90,           # click -> closing right-click
     "flash_ms": 35,                # time for the color dot to appear
@@ -611,6 +612,28 @@ if IS_WIN:
     def foreground():
         return user32.GetForegroundWindow()
 
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.QueryFullProcessImageNameW.argtypes = (
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD))
+
+    def exe_name(hwnd):
+        """File name of the program that owns a window, e.g. CLIPStudioPaint.exe."""
+        pid = window_pid(hwnd)
+        h = kernel32.OpenProcess(0x1000, False, pid) if pid else None  # QUERY_LIMITED
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(520)
+            n = wintypes.DWORD(len(buf))
+            if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                return os.path.basename(buf.value)
+            return ""
+        finally:
+            kernel32.CloseHandle(h)
+
     def focus(hwnd):
         if hwnd and user32.IsWindow(hwnd) and user32.GetForegroundWindow() != hwnd:
             user32.SetForegroundWindow(hwnd)
@@ -1151,6 +1174,16 @@ class LumaPicker(QWidget):
         except ValueError as exc:
             QGuiApplication.clipboard().setText(hx)
             self.notify("pick_shortcut is not valid (%s). Copied %s instead." % (exc, hx))
+            self._finish_apply(hx)
+            return
+        # only send the pick shortcut to a painting app: in any other program
+        # (browser, chat app, ...) the same keys can open dialogs or do harm
+        apps = [a.lower() for a in self.settings.get("pick_apps", []) if isinstance(a, str)]
+        exe = exe_name(self.target_hwnd).lower()
+        if apps and exe not in apps:
+            QGuiApplication.clipboard().setText(hx)
+            self.show_toast("Not Clip Studio: copied")
+            self._log("target %r not in pick_apps, copied instead" % exe)
             self._finish_apply(hx)
             return
         self.applying = True
