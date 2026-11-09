@@ -1117,7 +1117,6 @@ class LumaPicker(QWidget):
         self.update()
 
     def surroundings(self):
-        L, a, b = self._base()
         return surroundings(self.surface(), self.shades(),
                             float(self.settings.get("hue_shift_strength", 1.0)))
 
