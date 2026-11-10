@@ -18,12 +18,10 @@ def test_hex_round_trip(hx):
 
 def test_field_is_one_lightness():
     L = 0.65
-    cx, cy, half = lp.fit_for_L(L)
-    t = np.linspace(-half, half, 60)
-    A, B = np.meshgrid(cx + t, cy + t)
+    A, B, _ = lp.field_ab(60, L, False, "square")
     r, g, b = lp.oklab_to_linear(L, A, B)
     ok = lp.in_gamut(r, g, b)
-    assert ok.mean() > 0.2
+    assert ok.mean() > 0.99                        # every cell is a real color
     Lr, _, _ = lp.linear_to_oklab(r[ok], g[ok], b[ok])
     assert np.allclose(Lr, L, atol=1e-3)
 
@@ -66,7 +64,7 @@ def test_harmonies(name, offsets):
 
 def test_surroundings():
     shades = lp.shading_rows(*lp.hex_to_oklab("#a8783a"))
-    floor, bounce = lp.surroundings("#d6d6d6", "#a8783a", shades)
+    floor, bounce = lp.surroundings("#d6d6d6", shades)
     assert len(floor) == 4 and len(bounce) == 4
     # floor shadow gets lighter toward the soft edge
     vs = [_hsv(c)[2] for c in floor]
@@ -78,3 +76,158 @@ def test_parse_combo():
     assert lp.parse_combo("F13")[1] == 0x7C
     with pytest.raises(ValueError):
         lp.parse_combo("ctrl+nonsense")
+
+
+# ---- "luminance" value mode (Clip Studio's grey-layer check)
+def _luma(hx):
+    return lp.luma_of_hex(hx)
+
+
+@pytest.mark.parametrize("Y", [0.15, 0.4, 0.64, 0.9])
+def test_luma_field_is_one_luminance(Y):
+    A, B, _ = lp.field_ab(40, Y, True, "square")
+    r, g, b = lp.oklab_to_linear(lp.L_for_luma(Y, A, B), A, B)
+    ok = lp.in_gamut(r, g, b)
+    assert ok.mean() > 0.99
+    s = lp.linear_to_srgb(np.stack([r[ok], g[ok], b[ok]]))
+    assert np.allclose(lp.luma_of_srgb(*s), Y, atol=2e-3)
+
+
+def test_square_field_layout():
+    A, B, _ = lp.field_ab(48, 0.7, False, "square", cells=12)
+    C = np.hypot(A, B)
+    assert C[0].max() < C[-1].min()                # pale top, strong bottom
+    assert np.allclose(A[:4, :4], A[0, 0]) and np.allclose(B[:4, :4], B[0, 0])  # flat 4x4 cells
+    h = np.degrees(np.arctan2(B[-1], A[-1])) % 360
+    assert abs(h[0] - (lp.SQUARE_HUE0 + 15) % 360) < 1   # first cell center hue
+
+
+def test_mask_turns_to_color():
+    rot = lp.mask_rotation_for(100, (0, 120, 240), 0)
+    assert lp.mask_allows(100, (0, 120, 240), rot, 20)
+    assert rot == 340                               # nearest sector (120) moved -20°
+
+
+def test_luma_color_hits_target_and_fits_gamut():
+    for hue in range(0, 360, 30):
+        h = np.radians(hue)
+        L, a, b = lp.luma_color(0.6, 0.3 * np.cos(h), 0.3 * np.sin(h))
+        assert abs(_luma(lp.oklab_to_hex(float(L), float(a), float(b))) - 0.6) < 0.01
+
+
+def test_luma_differs_from_perceptual():
+    # same OKLab L, very different grey value: the reason the mode exists
+    L = 0.6
+    red = lp._lch_to_hex(L, 0.4, 20)
+    green = lp._lch_to_hex(L, 0.4, 120)
+    assert abs(_luma(red) - _luma(green)) > 0.1
+
+
+def test_harmony_keeps_luminance():
+    L, a, b = lp.hex_to_oklab("#c0607a")
+    Y = _luma("#c0607a")
+    for hx, _h, _base in lp.harmony_colors(L, a, b, (0, 120, 240), luma=Y):
+        assert abs(_luma(hx) - Y) < 0.01
+
+
+# ---- round wheel + gamut masks
+@pytest.mark.parametrize("luma", [False, True])
+def test_round_wheel_rim_is_in_gamut_and_one_value(luma):
+    v = 0.6
+    A, B, inside = lp.field_ab(60, v, luma, "round")
+    A, B = A[inside], B[inside]
+    L = lp.L_for_luma(v, A, B) if luma else np.full_like(A, v)
+    r, g, b = lp.oklab_to_linear(L, A, B)
+    assert lp.in_gamut(r, g, b).mean() > 0.99      # the whole disc is usable
+    if luma:
+        s = lp.linear_to_srgb(np.stack([r, g, b]))
+        assert np.allclose(lp.luma_of_srgb(*s), v, atol=2e-3)
+
+
+def test_mask_allows_and_snaps():
+    tri = (0, 120, 240)
+    assert lp.mask_allows(10, tri, 0, 40)
+    assert not lp.mask_allows(60, tri, 0, 40)
+    assert lp.mask_allows(70, tri, 60, 40)          # rotated
+    assert lp.mask_snap(30, tri, 0, 40) == 20       # nearest sector edge
+    assert lp.mask_snap(355, (0,), 0, 40) == 355    # allowed: unchanged
+    assert lp.mask_snap(160, (0,), 0, 40) == 20     # 140° to 20, 180° to 340
+    assert lp.mask_snap(200, (0,), 0, 40) == 340
+    assert lp.mask_allows(123, (), 0, 40)            # mask off
+
+
+def _mean_luma(img):
+    arr = np.frombuffer(img.constBits(), np.uint8).reshape(img.height(), img.width(), 4)
+    return float(lp.luma_of_srgb(*(arr[..., :3].reshape(-1, 3).T / 255.0)).mean())
+
+
+@pytest.mark.parametrize("value, darker", [(0.85, True), (0.2, False)])
+def test_mask_grey_contrasts_with_value(value, darker):
+    m = ((0, 120, 240), 0, 40)
+    plain = _mean_luma(lp.render_view(value, 48, False, "square", None))
+    masked = _mean_luma(lp.render_view(value, 48, False, "square", m))
+    assert (masked < plain - 0.05) if darker else (masked > plain + 0.05)
+
+
+@pytest.mark.parametrize("name", ["eyedropper", "copy", "pin"])
+def test_icons_ship_with_the_app(name):
+    assert os.path.isfile(os.path.join(lp.ICON_DIR, name + ".png"))
+
+
+@pytest.mark.parametrize("luma", [False, True])
+def test_grey_panel_turns_one_value_field_flat(luma):
+    v = 0.6
+    img = lp.render_view(v, 40, luma, "square", None)
+    arr = np.frombuffer(img.constBits(), np.uint8).reshape(40, 40, 4)[..., :3] / 255.0
+    g = lp.to_grey(arr, luma)
+    assert g.max() - g.min() < 0.02            # the whole field is one grey
+
+
+def test_grey_matrix_rows_are_weights():
+    m = lp.grey_matrix((0.3, 0.59, 0.11))
+    assert np.allclose(m[:3, :3], [[0.3] * 3, [0.59] * 3, [0.11] * 3])
+    assert np.allclose(m[3:, 3:], np.eye(2))
+
+
+# ---- direct Clip Studio link (companion protocol)
+import csp_link as cl  # noqa: E402
+
+
+def test_qr_decodes():
+    s = cl._xor("127.0.0.1,192.168.1.5\t32035\tpw123\tG#1:2022.12".encode(), cl.QR_KEY).hex()
+    qr = cl.decode_qr("https://companion.clip-studio.com/rc/en-us?s=" + s)
+    assert qr == {"ips": ["127.0.0.1", "192.168.1.5"], "port": 32035,
+                  "password": "pw123", "generation": "G#1:2022.12"}
+    assert cl.decode_qr("https://evil.example.com/rc?s=" + s) is None
+    assert cl.decode_qr("not a url") is None
+
+
+def test_frame_round_trip():
+    raw = cl.frame(1, "SetCurrentColor", 7, {"RGBColorR": 18})
+    assert raw.endswith(b"\x1e\x00") and raw[0] == 1
+    assert cl.parse_frame(raw[:-1]) == (1, "SetCurrentColor", 7, {"RGBColorR": 18})
+    assert cl.parse_frame(cl.frame(6, "TellHeartbeat", 2, "")[:-1])[3] is None
+
+
+def test_auth_detail_xors_secrets():
+    d = cl.auth_detail("G#1:2022.12", "ab", "cd")
+    assert d[0] == "G#1:2022.12"
+    assert bytes.fromhex(d[1]) == bytes([ord("a") ^ 0xB6, ord("b") ^ 0xD5])
+
+
+@pytest.mark.parametrize("shape", ["focus", "full"])
+@pytest.mark.parametrize("luma", [False, True])
+def test_focus_plane_is_one_value(shape, luma):
+    v = 0.6
+    A, B, _ = lp.field_ab(48, v, luma, shape)
+    L = lp.L_for_luma(v, A, B) if luma else np.full_like(A, v)
+    r, g, b = lp.oklab_to_linear(L, A, B)
+    ok = lp.in_gamut(r, g, b)
+    assert 0.05 < ok.mean() < 0.95                 # a slice with grey around it
+    if luma:
+        s = lp.linear_to_srgb(np.stack([r[ok], g[ok], b[ok]]))
+        assert np.allclose(lp.luma_of_srgb(*s), v, atol=2e-3)
+
+
+def test_focus_zooms_in_on_the_slice():
+    assert lp.plane_view(0.9, False, "focus")[2] < lp.plane_view(0.9, False, "full")[2]

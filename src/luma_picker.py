@@ -8,14 +8,12 @@ the neutral grey of the same lightness, so the whole field is one value.
 Extras: shading ramps (cool shadows / warm lights), color harmonies, floor
 shadow + bounce light suggestions, a screen eyedropper and hex copy/paste.
 
-Windows: a global hotkey opens the panel. Picking a color sends it to
-Clip Studio Paint through CSP's own "Pick screen color" command (give that
-command a shortcut in CSP). Elsewhere / apply_mode "clipboard": the hex code
-is copied instead.
+Windows: a global hotkey opens the panel. Picking a color sets it in
+Clip Studio Paint directly, over CSP's companion connection (csp_link.py).
 
 https://github.com/zowato/luma-picker  -  MIT License
 """
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import colorsys
 import ctypes
@@ -24,11 +22,12 @@ import os
 import sys
 
 import numpy as np
+from csp_link import CspLink, decode_qr, find_qr_url
 from PySide6.QtCore import QDateTime, QObject, QPointF, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import (QColor, QConicalGradient, QCursor, QFont,
                            QGuiApplication, QIcon, QImage, QPainter,
                            QPainterPath, QPen, QPixmap)
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QToolTip, QWidget
 
 IS_WIN = sys.platform == "win32"
 
@@ -45,15 +44,19 @@ SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
 DEFAULTS = {
     "hotkey": "ctrl+alt+shift+c",
     "eyedropper_hotkey": "ctrl+alt+shift+e",   # pick a color from the screen
-    "apply_mode": "screen_pick",          # "screen_pick" or "clipboard"
-    "pick_shortcut": "ctrl+alt+shift+o",  # CSP: Edit > Pick screen color
-    "pick_delay_ms": 250,          # longest wait for CSP's picker window
-    "exit_delay_ms": 90,           # click -> closing right-click
-    "flash_ms": 35,                # time for the color dot to appear
-    "picker_ready_ms": 150,        # earliest click after CSP's picker opens
+    "greyscale_hotkey": "ctrl+alt+shift+g",    # whole screen in greyscale on/off
+    "grey_panel": False,                       # show the panel itself in greyscale
     "hue_shift_strength": 1.0,     # 0.5 = subtle, 2 = strong hue shifting
-    "right_click_to_exit_pick": True,
-    "after_pick_shortcut": "",            # e.g. "b" to go back to the brush
+    "value_mode": "perceptual",    # or "luminance" (Clip Studio's grey check)
+    "luma_weights": [0.30, 0.59, 0.11],   # R, G, B weights of "luminance"
+    "field_shape": "square",       # "round": hue wheel, "focus": a/b plane slice
+    "focus_zoom": True,            # focus view: zoom to the slice, or show the full plane
+    "field_cells": 24,             # color blocks per side of the square field
+    "mask": 0,                     # index into MASKS (0 = off)
+    "mask_rotate": 0,              # degrees
+    "mask_width": 60,              # degrees per allowed hue sector
+    "wheel_step": 0.01,            # mouse wheel over field/bar: value per notch
+    "wheel_send_ms": 350,          # send to CSP this long after the last notch
     "also_copy_hex": False,
     "auto_hide": True,
     "auto_hide_distance": 60,
@@ -153,18 +156,7 @@ def hex_to_oklab(hx):
 
 
 # ---------------------------------------------------------- shading ideas
-# Hue anchors in OKLCH degrees: shadows lean toward blue-violet, lights
-# toward warm yellow (the "hue contrast" way of shading).
-SHADOW_HUE = 275.0
-LIGHT_HUE = 95.0
 SHADE_N = 7  # swatches per row, base color in the middle
-
-
-def _toward(h, target, amount):
-    """Rotate hue h toward target by up to `amount` degrees (shortest way)."""
-    d = (target - h + 540.0) % 360.0 - 180.0
-    step = max(-abs(amount), min(abs(amount), d))
-    return (h + step) % 360.0
 
 
 def _lch_to_hex(L, C, h):
@@ -255,8 +247,9 @@ HARMONIES = [
 ]
 
 
-def harmony_colors(L, a, b, offsets):
+def harmony_colors(L, a, b, offsets, luma=None):
     """Partner colors at the same lightness, rotated around the hue wheel.
+    luma: keep this luminance instead (the "luminance" value mode).
     Returns [(hex, hue_degrees, is_base), ...] in the order given."""
     a, b = (float(v) for v in clamp_chroma(L, a, b))
     C = float(np.hypot(a, b))
@@ -269,7 +262,13 @@ def harmony_colors(L, a, b, offsets):
             continue
         hk = (h + off) % 360.0
         # a grey has no hue of its own: give the partners a gentle tint
-        out.append((_lch_to_hex(L, 0.08 if neutral else C, hk), hk, False))
+        Ck = 0.08 if neutral else C
+        if luma is None:
+            out.append((_lch_to_hex(L, Ck, hk), hk, False))
+        else:
+            r = np.radians(hk)
+            Lk, ak, bk = luma_color(luma, Ck * np.cos(r), Ck * np.sin(r))
+            out.append((oklab_to_hex(float(Lk), float(ak), float(bk)), hk, False))
     return out
 
 
@@ -290,7 +289,7 @@ def _hsv_of(hx):
     return h * 360.0, s, v
 
 
-def surroundings(surface_hex, object_hex, shadow_hexes, shift=1.0):
+def surroundings(surface_hex, shadow_hexes, shift=1.0):
     """Suggestions for the area around an object.
 
     floor:  the object's cast shadow on the surface, from the dark contact
@@ -325,39 +324,12 @@ def surroundings(surface_hex, object_hex, shadow_hexes, shift=1.0):
     return floor, bounce
 
 
-_fit_cache = {}
-
-
-def fit_for_L(L):
-    """Center and half-size of the view so the gamut slice fills the field."""
-    key = round(float(L), 3)
-    if key not in _fit_cache:
-        h = np.linspace(0, 2 * np.pi, 144, endpoint=False)
-        a, b = clamp_chroma(np.full_like(h, key), np.cos(h) * 0.5, np.sin(h) * 0.5)
-        cx, cy = (a.min() + a.max()) / 2, (b.min() + b.max()) / 2
-        half = max(a.max() - a.min(), b.max() - b.min()) / 2 * 1.14
-        _fit_cache[key] = (float(cx), float(cy), float(max(half, 0.02)))
-    return _fit_cache[key]
-
-
-def _to_qimage(rgb):  # rgb: H x W x 3 floats in sRGB 0..1
+def _to_qimage(rgb, opaque=None):  # rgb: H x W x 3 floats in sRGB 0..1
     h, w, _ = rgb.shape
     arr = np.empty((h, w, 4), dtype=np.uint8)
     arr[..., :3] = np.clip(np.round(rgb * 255), 0, 255).astype(np.uint8)
-    arr[..., 3] = 255
+    arr[..., 3] = 255 if opaque is None else np.where(opaque, 255, 0)
     return QImage(arr.data, w, h, w * 4, QImage.Format_RGBA8888).copy()
-
-
-def render_field(L, n):
-    cx, cy, half = fit_for_L(L)
-    t = (np.arange(n) + 0.5) / n * 2 * half - half
-    A, B = np.meshgrid(cx + t, cy - t)
-    r, g, b = oklab_to_linear(L, A, B)
-    ok = in_gamut(r, g, b)
-    gr, gg, gb = oklab_to_linear(L, 0.0, 0.0)
-    rgb = np.stack([np.where(ok, r, gr), np.where(ok, g, gg),
-                    np.where(ok, b, gb)], axis=-1)
-    return _to_qimage(linear_to_srgb(rgb))
 
 
 def render_slider(a, b, w, h):
@@ -367,9 +339,270 @@ def render_slider(a, b, w, h):
     return _to_qimage(np.repeat(rgb[None, :, :], h, axis=0))
 
 
+# ------------------------------------------------- "luminance" value mode
+# Value the way Clip Studio shows it when you check values with a grey layer
+# in Color blend mode: a weighted sum of the gamma-encoded sRGB channels
+# (the usual Color-blend formula). Set from settings["luma_weights"].
+LUMA_W = (0.30, 0.59, 0.11)
+
+
+def apply_luma_weights(settings):
+    global LUMA_W
+    try:
+        w = tuple(float(x) for x in settings.get("luma_weights", LUMA_W))
+        if len(w) == 3 and sum(w) > 0:
+            LUMA_W = tuple(x / sum(w) for x in w)
+    except (TypeError, ValueError):
+        pass
+
+
+def luma_of_srgb(r, g, b):
+    return LUMA_W[0] * r + LUMA_W[1] * g + LUMA_W[2] * b
+
+
+def luma_of_hex(hx):
+    return float(luma_of_srgb(*_hex_rgb(hx)))
+
+
+def L_for_luma(Y, a, b, iters=18):
+    """OKLab L that gives hue/chroma (a, b) the luminance Y (vectorized)."""
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    lo = np.zeros(np.broadcast(Y, a, b).shape)
+    hi = np.ones_like(lo)
+    for _ in range(iters):
+        mid = (lo + hi) / 2
+        r, g, bl = linear_to_srgb(np.stack(oklab_to_linear(mid, a, b)))
+        low = luma_of_srgb(r, g, bl) < Y
+        lo = np.where(low, mid, lo)
+        hi = np.where(low, hi, mid)
+    return (lo + hi) / 2
+
+
+def luma_color(Y, a, b):
+    """(L, a, b) with luminance Y, chroma pulled in until it fits sRGB."""
+    a, b = (np.asarray(x, dtype=float) for x in np.broadcast_arrays(a, b))
+    ok = in_gamut(*oklab_to_linear(L_for_luma(Y, a, b), a, b))
+    # largest chroma (same hue) whose color of luminance Y still fits sRGB
+    lo, hi = np.zeros(np.broadcast(Y, a).shape), np.ones(np.broadcast(Y, a).shape)
+    for _ in range(16):
+        mid = (lo + hi) / 2
+        m = in_gamut(*oklab_to_linear(L_for_luma(Y, a * mid, b * mid, 14),
+                                      a * mid, b * mid))
+        lo, hi = np.where(m, mid, lo), np.where(m, hi, mid)
+    t = np.where(ok, 1.0, lo)
+    a, b = a * t, b * t
+    return L_for_luma(Y, a, b), a, b
+
+
+
+
+_cmax_cache = {}
+
+
+def max_chroma(value, luma=False):
+    """Largest in-gamut OKLab chroma for each whole hue degree (0..359)
+    at this lightness (or luminance, if luma)."""
+    key = (round(float(value), 3), bool(luma), LUMA_W if luma else None)
+    if key not in _cmax_cache:
+        h = np.radians(np.arange(360.0))
+        c, s = np.cos(h), np.sin(h)
+        if luma:
+            lo, hi = np.zeros(360), np.full(360, 0.5)
+            for _ in range(16):
+                mid = (lo + hi) / 2
+                ok = in_gamut(*oklab_to_linear(L_for_luma(key[0], c * mid, s * mid, 14),
+                                               c * mid, s * mid))
+                lo, hi = np.where(ok, mid, lo), np.where(ok, hi, mid)
+            _cmax_cache[key] = lo
+        else:
+            a, b = clamp_chroma(np.full(360, key[0]), c * 0.5, s * 0.5)
+            _cmax_cache[key] = np.hypot(a, b)
+    return _cmax_cache[key]
+
+
+def cmax_at(table, h_deg):
+    """Max chroma at any hue (degrees), interpolated from max_chroma()."""
+    return np.interp(np.asarray(h_deg) % 360.0, np.arange(361.0), np.append(table, table[0]))
+
+
+# --------------------------------------------------------------- gamut masks
+# Hue sectors you may pick from (centers in degrees, before rotation).
+# Masked hues stay visible but dimmed, and picking snaps to the nearest
+# allowed hue. Near-greys are always allowed.
+MASKS = [
+    ("Mask off", ()),
+    ("Analogous", (0,)),
+    ("Complement", (0, 180)),
+    ("Split compl.", (0, 150, 210)),
+    ("Triad", (0, 120, 240)),
+]
+MASK_GREY_C = 0.015   # chroma below this counts as grey (never masked)
+
+
+def _hue_dist(h, c):
+    return np.abs((np.asarray(h) - c + 540.0) % 360.0 - 180.0)
+
+
+def mask_allows(h_deg, centers, rotate, width):
+    if not centers:
+        return np.ones(np.shape(h_deg), dtype=bool)
+    return np.min([_hue_dist(h_deg, c + rotate) for c in centers], axis=0) <= width / 2
+
+
+def mask_snap(h_deg, centers, rotate, width):
+    """The allowed hue nearest to h_deg (h_deg itself if it is allowed)."""
+    if not centers or mask_allows(h_deg, centers, rotate, width):
+        return h_deg % 360.0
+    best = None
+    for c in centers:
+        for edge in (c + rotate - width / 2, c + rotate + width / 2):
+            d = float(_hue_dist(h_deg, edge))
+            if best is None or d < best[0]:
+                best = (d, edge % 360.0)
+    return best[1]
+
+
+def mask_rotation_for(h_deg, centers, rotate):
+    """Mask rotation that puts the nearest sector's middle on hue h_deg."""
+    d = min(((h_deg - c - rotate + 540.0) % 360.0 - 180.0 for c in centers), key=abs)
+    return (rotate + d) % 360.0
+
+
+# Square field: hue runs left -> right from this OKLCH hue (red), the share
+# of each hue's max chroma runs top (pale) -> bottom (strongest).
+SQUARE_HUE0 = 30.0
+
+
+def square_hue_share(fx, fy):
+    """Field fractions (0..1, top-left origin) -> (hue degrees, chroma share)."""
+    return (SQUARE_HUE0 + np.asarray(fx) * 360.0) % 360.0, np.asarray(fy)
+
+
+FULL_HALF = 0.34      # "full" plane view: a, b from -0.34 to 0.34 (all of sRGB)
+
+
+def plane_view(value, luma, shape):
+    """Center and half-size of the a/b plane view. "focus" zooms so the
+    slice of this value fills the field, "full" shows the whole plane."""
+    if shape != "focus":
+        return 0.0, 0.0, FULL_HALF
+    h = np.arange(0, 360, 2.5)
+    c = cmax_at(max_chroma(value, luma), h)
+    a, b = c * np.cos(np.radians(h)), c * np.sin(np.radians(h))
+    half = max(a.max() - a.min(), b.max() - b.min()) / 2 * 1.14
+    return float(a.max() + a.min()) / 2, float(b.max() + b.min()) / 2, float(max(half, 0.02))
+
+
+def field_ab(n, value, luma, shape, cells=24):
+    """OKLab a, b of every pixel of an n x n field, plus the drawable area.
+    The square field is made of cells x cells flat color blocks; "focus" and
+    "full" are the plain a/b plane (out-of-gamut parts drawn grey)."""
+    t = (np.arange(n) + 0.5) / n
+    if shape in ("focus", "full"):
+        cx, cy, half = plane_view(value, luma, shape)
+        A, B = np.meshgrid(cx + (t * 2 - 1) * half, cy - (t * 2 - 1) * half)
+        return A, B, np.ones_like(A, dtype=bool)
+    if shape == "round":
+        # angle = hue, radius = share of the most chroma this hue can have
+        x, y = np.meshgrid(t * 2 - 1, 1 - t * 2)
+        r, h = np.hypot(x, y), np.degrees(np.arctan2(y, x)) % 360.0
+        C = np.minimum(r, 1.0) * cmax_at(max_chroma(value, luma), h)
+    else:
+        q = (np.floor(t * cells) + 0.5) / cells           # cell centers
+        h, s = square_hue_share(*np.meshgrid(q, q))
+        C, r = s * cmax_at(max_chroma(value, luma), h), np.zeros_like(s)
+    hr = np.radians(h)
+    return C * np.cos(hr), C * np.sin(hr), r <= 1.0
+
+
+def render_view(value, n, luma=False, shape="square", mask=None, cells=24):
+    """The big field. value = OKLab L, or luminance if luma.
+    mask = (centers, rotate, width) or None."""
+    A, B, inside = field_ab(n, value, luma, shape, cells)
+    if luma and shape == "square":
+        # flat cells: solve L once per cell and spread it over the cell
+        Lc = L_for_luma(value, *field_ab(cells, value, luma, shape, cells)[:2])
+        idx = np.minimum((np.arange(n) + 0.5) / n * cells, cells - 1).astype(int)
+        L = Lc[idx][:, idx]
+        grey = np.full(3, min(max(value, 0.0), 1.0))     # same luminance
+    elif luma:
+        # solving L per pixel is slow; L changes smoothly across the field,
+        # so solve it on a coarse grid and interpolate (picks stay exact)
+        m = max(n // 4, 24)
+        Lc = L_for_luma(value, *field_ab(m, value, luma, shape)[:2])
+        pos = np.clip((np.arange(n) + 0.5) / n * m - 0.5, 0, m - 1)
+        i0 = np.minimum(pos.astype(int), m - 2)
+        f = pos - i0
+        Lr = Lc[i0] * (1 - f)[:, None] + Lc[i0 + 1] * f[:, None]          # rows
+        L = Lr[:, i0] * (1 - f)[None, :] + Lr[:, i0 + 1] * f[None, :]     # cols
+        grey = np.full(3, min(max(value, 0.0), 1.0))     # same luminance
+    else:
+        L = value
+        grey = linear_to_srgb(np.array(oklab_to_linear(value, 0.0, 0.0)))
+    r, g, b = oklab_to_linear(L, A, B)
+    ok = in_gamut(r, g, b)
+    rgb = linear_to_srgb(np.stack([r, g, b], axis=-1))
+    rgb[~ok] = grey
+    if mask and mask[0]:
+        hue = np.degrees(np.arctan2(B, A)) % 360.0
+        off = ok & ~mask_allows(hue, *mask)
+        dull = grey + (rgb[off] - grey) * 0.22            # visible, but dull
+        # and pushed away from the picked value so the allowed hues stand out:
+        # darker when the value is light, lighter when it is dark
+        rgb[off] = dull * 0.62 if value >= 0.5 else dull + (1 - dull) * 0.38
+    return _to_qimage(rgb, inside)
+
+
+def to_grey(rgb, luma):
+    """sRGB 0..1 (... x 3) -> grey of the same value: luminance, or OKLab L."""
+    if luma:
+        return luma_of_srgb(rgb[..., 0], rgb[..., 1], rgb[..., 2])
+    L = linear_to_oklab(*np.moveaxis(srgb_to_linear(rgb), -1, 0))[0]
+    return linear_to_srgb(np.clip(L, 0, 1) ** 3)       # OKLab grey: lin = L^3
+
+
+def grey_matrix(weights):
+    """5x5 color matrix (row = input channel) that turns the screen grey."""
+    m = np.eye(5, dtype=np.float32)
+    for i, w in enumerate(weights):
+        m[i, :3] = w
+    return m
+
+
+_mag = {}
+
+
+def set_screen_grey(on, weights=None):
+    """Whole desktop in greyscale (Windows Magnification API full-screen
+    color effect), or back to normal. False if unsupported. Screen captures
+    see the grey too, so the eyedropper lifts it while it grabs."""
+    if not IS_WIN:
+        return False
+    try:
+        if "dll" not in _mag:
+            dll = ctypes.WinDLL("Magnification")
+            dll.MagInitialize.restype = ctypes.c_bool
+            dll.MagSetFullscreenColorEffect.restype = ctypes.c_bool
+            dll.MagSetFullscreenColorEffect.argtypes = (ctypes.c_void_p,)
+            if not dll.MagInitialize():
+                return False
+            _mag["dll"] = dll
+        m = grey_matrix(weights or LUMA_W) if on else np.eye(5, dtype=np.float32)
+        buf = (ctypes.c_float * 25)(*m.flatten().tolist())
+        return bool(_mag["dll"].MagSetFullscreenColorEffect(ctypes.byref(buf)))
+    except (OSError, AttributeError):
+        return False
+
+
+def render_slider_luma(a, b, w, h):
+    Ys = (np.arange(w) + 0.5) / w
+    L, aa, bb = luma_color(Ys, np.full(w, a), np.full(w, b))
+    rgb = linear_to_srgb(np.stack(oklab_to_linear(L, aa, bb), axis=-1))
+    return _to_qimage(np.repeat(rgb[None, :, :], h, axis=0))
+
+
 # ------------------------------------------------------------ windows glue
 MOD_FLAG = {"alt": 0x1, "ctrl": 0x2, "shift": 0x4, "win": 0x8}
-MOD_VK = {"ctrl": 0x11, "alt": 0x12, "shift": 0x10, "win": 0x5B}
 NAMED_VK = {"space": 0x20, "tab": 0x09, "enter": 0x0D, "esc": 0x1B,
             "insert": 0x2D, "delete": 0x2E, "home": 0x24, "end": 0x23,
             "pageup": 0x21, "pagedown": 0x22, "pause": 0x13,
@@ -403,57 +636,10 @@ def parse_combo(text):
 if IS_WIN:
     from ctypes import wintypes
     user32 = ctypes.WinDLL("user32", use_last_error=True)
-    ULONG_PTR = ctypes.c_size_t
-
-    class KEYBDINPUT(ctypes.Structure):
-        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
-                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
-                    ("dwExtraInfo", ULONG_PTR)]
-
-    class MOUSEINPUT(ctypes.Structure):
-        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
-                    ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
-                    ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
-
-    class HARDWAREINPUT(ctypes.Structure):
-        _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
-                    ("wParamH", wintypes.WORD)]
-
-    class _INPUTUNION(ctypes.Union):
-        _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
-
-    class INPUT(ctypes.Structure):
-        _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
-
-    user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
     user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
     user32.GetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int)
     user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
     user32.SetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t)
-    user32.GetForegroundWindow.restype = wintypes.HWND
-    user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
-    user32.IsWindow.argtypes = (wintypes.HWND,)
-
-    def _send(inputs):
-        arr = (INPUT * len(inputs))(*inputs)
-        user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
-
-    def _key(vk, up=False):
-        scan = user32.MapVirtualKeyW(vk, 0)
-        return INPUT(type=1, u=_INPUTUNION(ki=KEYBDINPUT(
-            wVk=vk, wScan=scan, dwFlags=0x2 if up else 0, time=0, dwExtraInfo=0)))
-
-    def send_combo(text):
-        mods, vk = parse_combo(text)
-        down = [_key(MOD_VK[m]) for m in mods] + [_key(vk)]
-        up = [_key(vk, True)] + [_key(MOD_VK[m], True) for m in reversed(mods)]
-        _send(down + up)
-
-    def click(button="left"):
-        d, u = (0x2, 0x4) if button == "left" else (0x8, 0x10)
-        mk = lambda f: INPUT(type=0, u=_INPUTUNION(mi=MOUSEINPUT(
-            dx=0, dy=0, mouseData=0, dwFlags=f, time=0, dwExtraInfo=0)))
-        _send([mk(d), mk(u)])
 
     def set_noactivate(hwnd):
         GWL_EXSTYLE = -20
@@ -469,36 +655,6 @@ if IS_WIN:
         # HWND_TOPMOST / HWND_NOTOPMOST; SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE
         user32.SetWindowPos(hwnd, wintypes.HWND(-1 if on else -2), 0, 0, 0, 0,
                             0x0001 | 0x0002 | 0x0010)
-
-    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    user32.EnumWindows.argtypes = (WNDENUMPROC, wintypes.LPARAM)
-    user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND,
-                                                ctypes.POINTER(wintypes.DWORD))
-    user32.IsWindowVisible.argtypes = (wintypes.HWND,)
-
-    def window_pid(hwnd):
-        pid = wintypes.DWORD(0)
-        if hwnd:
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        return pid.value
-
-    def visible_windows_of(pid):
-        """Visible top-level windows belonging to a process."""
-        found = set()
-
-        def cb(h, _):
-            if user32.IsWindowVisible(h) and window_pid(h) == pid:
-                found.add(int(h) if h else 0)
-            return True
-        user32.EnumWindows(WNDENUMPROC(cb), 0)
-        return found
-
-    def foreground():
-        return user32.GetForegroundWindow()
-
-    def focus(hwnd):
-        if hwnd and user32.IsWindow(hwnd) and user32.GetForegroundWindow() != hwnd:
-            user32.SetForegroundWindow(hwnd)
 
 
 class HotkeyWindow(QWidget):
@@ -529,9 +685,25 @@ class HotkeyWindow(QWidget):
 W = 288
 PAD = 12
 HEADER_H = 44                      # drag the window by this top bar
-FIELD = QRect(PAD, 46, W - 2 * PAD, W - 2 * PAD)
+LINK_RECT = QRect(PAD, 44, W - 2 * PAD, 32)     # Clip Studio connection status
+LINK_BTN = QRect(W - PAD - 64, 45, 64, 16)
+FIELD = QRect(PAD, LINK_RECT.bottom() + 5, W - 2 * PAD, W - 2 * PAD)
+ZOOM_BTN = QRect(FIELD.right() - 50, FIELD.top() + 6, 44, 18)   # Focus/Full (focus view)
 SLIDER = QRect(PAD, FIELD.bottom() + 11, W - 2 * PAD, 24)
-HIST_Y = SLIDER.bottom() + 11
+VIEW_Y = SLIDER.bottom() + 10                     # Square|Round  ·  mask
+SHAPE_SQ = QRect(PAD, VIEW_Y, 37, 18)
+SHAPE_RD = QRect(SHAPE_SQ.right() + 1, VIEW_Y, 37, 18)
+SHAPE_FO = QRect(SHAPE_RD.right() + 1, VIEW_Y, 37, 18)
+GREY_BTN = QRect(SHAPE_FO.right() + 5, VIEW_Y, 18, 18)      # panel in greyscale
+SCREEN_BTN = QRect(GREY_BTN.right() + 3, VIEW_Y, 18, 18)    # screen in greyscale
+MASK_PREV = QRect(SCREEN_BTN.right() + 4, VIEW_Y, 18, 18)
+MASK_NEXT = QRect(W - PAD - 18, VIEW_Y, 18, 18)
+MASK_NAME = QRect(MASK_PREV.right() + 1, VIEW_Y,
+                  MASK_NEXT.left() - MASK_PREV.right() - 2, 18)
+MASK_SL_Y = VIEW_Y + 26                           # Rotate / Width sliders
+ROT_SL = QRect(PAD + 42, MASK_SL_Y, 82, 14)
+WID_SL = QRect(W - PAD - 82, MASK_SL_Y, 82, 14)
+HIST_Y = MASK_SL_Y + 14 + 12
 HIST_N = 8
 HIST_GAP = 6
 HIST_SIZE = (FIELD.width() - HIST_GAP * (HIST_N - 1)) // HIST_N
@@ -580,12 +752,45 @@ def harm_rect(i, n):
 CLOSE_BTN = QRect(W - PAD - 20, 12, 20, 20)
 PIN_BTN = QRect(CLOSE_BTN.left() - 24, 12, 20, 20)
 TOP_BTN = QRect(PIN_BTN.left() - 24, 12, 20, 20)
-NEW_SW = QRect(TOP_BTN.left() - 8 - 28, 13, 28, 18)
-OLD_SW = QRect(NEW_SW.left() - 28, 13, 28, 18)
-EYE_BTN = QRect(OLD_SW.left() - 26, 12, 20, 20)            # eyedropper
-HEX_RECT = QRect(PAD + 2, 12, EYE_BTN.left() - PAD - 6, 20)  # click = copy
+NEW_SW = QRect(TOP_BTN.left() - 8 - 22, 13, 22, 18)
+OLD_SW = QRect(NEW_SW.left() - 22, 13, 22, 18)
+EYE_BTN = QRect(OLD_SW.left() - 24, 12, 20, 20)            # eyedropper
+TOAST_RECT = QRect(PAD + 2, 12, EYE_BTN.left() - PAD - 6, 20)
+HEX_RECT = QRect(PAD + 2, 12, 58, 20)                       # click = copy
+COPY_BTN = QRect(HEX_RECT.right() + 1, 12, 18, 20)
+MODE_BTN = QRect(COPY_BTN.right() + 3, 13, EYE_BTN.left() - COPY_BTN.right() - 7, 18)
 
-BG, BORDER, TEXT, DIM = "#1c1c22", "#5b4bd1", "#d8d8e4", "#7d7d8c"
+# warm orange accent; ACTIVE = background of a switched-on button
+BG, BORDER, TEXT, DIM = "#1c1c22", "#e8963a", "#d8d8e4", "#7d7d8c"
+ACTIVE = "#3d2e1c"
+
+if getattr(sys, "frozen", False):
+    ICON_DIR = os.path.join(getattr(sys, "_MEIPASS", ""), "assets", "icons")
+else:
+    ICON_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "assets", "icons")
+_icon_cache = {}
+
+
+def icon(name, color, size, dpr=1.0):
+    """assets/icons/<name>.png (black on transparent) tinted in color."""
+    key = (name, color, size, dpr)
+    if key not in _icon_cache:
+        src = QPixmap(os.path.join(ICON_DIR, name + ".png"))
+        pm = None
+        if not src.isNull():
+            px = int(round(size * dpr))
+            pm = QPixmap(px, px)
+            pm.fill(Qt.transparent)
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.SmoothPixmapTransform)
+            p.drawPixmap(pm.rect(), src)
+            p.setCompositionMode(QPainter.CompositionMode_SourceIn)
+            p.fillRect(pm.rect(), QColor(color))
+            p.end()
+            pm.setDevicePixelRatio(dpr)
+        _icon_cache[key] = pm
+    return _icon_cache[key]
 
 
 def hist_rect(i):
@@ -668,38 +873,6 @@ class ScreenSampler(QObject):
             self.picked.emit(hx)
 
 
-class FlashDot(QWidget):
-    """A few pixels of the picked color right under the pen tip. Clip Studio's
-    screen picker samples this instead of the whole panel changing color."""
-    SIZE = 9
-
-    def __init__(self):
-        # click-through: the pick click must land on the panel underneath,
-        # Clip Studio ignores clicks that hit this little window itself
-        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint
-                         | Qt.WindowStaysOnTopHint | Qt.WindowDoesNotAcceptFocus
-                         | Qt.WindowTransparentForInput)
-        self.setAttribute(Qt.WA_ShowWithoutActivating)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.setFixedSize(self.SIZE, self.SIZE)
-        self.color = QColor("#000000")
-        if IS_WIN:
-            set_noactivate(int(self.winId()))
-
-    def show_at_cursor(self, hx):
-        self.color = QColor(hx)
-        pos = QCursor.pos()
-        self.move(pos.x() - self.SIZE // 2, pos.y() - self.SIZE // 2)
-        if not self.isVisible():
-            self.show()
-        if IS_WIN:
-            set_topmost(int(self.winId()), True)
-        self.repaint()
-
-    def paintEvent(self, _):
-        QPainter(self).fillRect(self.rect(), self.color)
-
-
 class LumaPicker(QWidget):
     def __init__(self, settings, tray_notify=None):
         self.on_top = bool(settings.get("always_on_top", True))
@@ -714,15 +887,15 @@ class LumaPicker(QWidget):
         self.setWindowTitle("Luma Picker")
         self.settings = settings
         self.notify = tray_notify or (lambda *a: None)
+        apply_luma_weights(settings)
         self.L, self.a, self.b = hex_to_oklab(settings.get("last_color", "#c0607a"))
+        self.Y = luma_of_hex(oklab_to_hex(self.L, self.a, self.b))
         self.applied_hex = self.current_hex()
+        self.wheel_timer = QTimer(self, singleShot=True,
+                                  timeout=lambda: self.apply_hex(self.current_hex()))
         self.history = [h for h in settings.get("history", []) if isinstance(h, str)][:HIST_N]
         self.dragging = None
-        self.applying = False
-        self.flash = None
-        self.dot = FlashDot()
         self.pinned = bool(settings.get("pinned", False))
-        self.target_hwnd = None
         self.move_offset = None
         self._field_key = self._slider_key = None
         self._shade_key = None
@@ -731,6 +904,12 @@ class LumaPicker(QWidget):
         self.pending = None         # swatch pressed, sent when the pen lifts
         self.sampler = ScreenSampler()
         self.sampler.picked.connect(self._on_sampled)
+        # direct link to Clip Studio's companion connection (no screen reading)
+        self.link = CspLink(settings.setdefault("csp_link", {}),
+                            lambda: save_settings(self.settings))
+        self.link.state.connect(self._on_link)
+        self.pair_timer = QTimer(self, interval=700, timeout=self._look_for_qr)
+        self.link.connect_saved()
         self.sample_target = "surface"
         self.toast = None           # (text, until_ms) short message in the header
         self._field_img = self._slider_img = None
@@ -793,7 +972,113 @@ class LumaPicker(QWidget):
 
     def set_hex(self, hx):
         self.L, self.a, self.b = hex_to_oklab(hx)
+        self.Y = luma_of_hex(hx)
+        m = self.mask()
+        if m and np.hypot(self.a, self.b) >= MASK_GREY_C:
+            h = float(np.degrees(np.arctan2(self.b, self.a))) % 360.0
+            if not mask_allows(h, *m):      # turn the mask onto the new color
+                self.settings["mask_rotate"] = round(mask_rotation_for(h, m[0], m[1])) % 360
+                save_settings(self.settings)
         self.update()
+
+    def cells(self):
+        try:
+            return min(max(int(self.settings.get("field_cells", 24)), 4), 96)
+        except (TypeError, ValueError):
+            return 24
+
+    def luma_mode(self):
+        return self.settings.get("value_mode") == "luminance"
+
+    def value(self):
+        """What the bar controls: OKLab L, or luminance in "luminance" mode."""
+        return self.Y if self.luma_mode() else self.L
+
+    def set_value(self, v):
+        self.shade_base = None
+        v = min(max(v, 0.0), 1.0)
+        if self.luma_mode():
+            self.Y = v
+            self.L = float(luma_color(v, self.a, self.b)[0])
+        else:
+            self.L = v
+            self.Y = luma_of_hex(self.current_hex())
+        self.update()
+
+    def toggle_value_mode(self):
+        on = not self.luma_mode()
+        self.settings["value_mode"] = "luminance" if on else "perceptual"
+        save_settings(self.settings)
+        self.Y = luma_of_hex(self.current_hex())   # same color, new ruler
+        self.show_toast("Value: CSP luminance" if on else "Value: perceptual")
+
+    def round_field(self):
+        return self.settings.get("field_shape") == "round"
+
+    def view_shape(self):
+        """square, round, or the a/b plane: focus (zoomed) / full."""
+        sh = self.settings.get("field_shape", "square")
+        if sh == "focus":
+            return "focus" if self.settings.get("focus_zoom", True) else "full"
+        return "round" if sh == "round" else "square"
+
+    def toggle_zoom(self):
+        self.settings["focus_zoom"] = not self.settings.get("focus_zoom", True)
+        save_settings(self.settings)
+        self.update()
+
+    def toggle_grey_panel(self):
+        on = not self.settings.get("grey_panel", False)
+        self.settings["grey_panel"] = on
+        save_settings(self.settings)
+        self.show_toast("Panel in greyscale" if on else "Panel in color")
+
+    def toggle_screen_grey(self):
+        on = not getattr(self, "screen_grey", False)
+        if not set_screen_grey(on):
+            self.screen_grey = False
+            self.show_toast("Screen greyscale not available")
+            return
+        self.screen_grey = on
+        self.show_toast("Screen in greyscale" if on else "Screen in color")
+
+    def set_shape(self, shape):
+        self.settings["field_shape"] = shape
+        save_settings(self.settings)
+        self.update()
+
+    def mask_index(self):
+        try:
+            return int(self.settings.get("mask", 0)) % len(MASKS)
+        except (TypeError, ValueError):
+            return 0
+
+    def mask(self):
+        """(centers, rotate, width) of the gamut mask, or None when off."""
+        centers = MASKS[self.mask_index()][1]
+        if not centers:
+            return None
+        try:
+            rot = float(self.settings.get("mask_rotate", 0)) % 360.0
+            wid = min(max(float(self.settings.get("mask_width", 60)), 10.0), 180.0)
+        except (TypeError, ValueError):
+            rot, wid = 0.0, 60.0
+        return centers, rot, wid
+
+    def cycle_mask(self, step):
+        self.settings["mask"] = (self.mask_index() + step) % len(MASKS)
+        save_settings(self.settings)
+        self.update()
+
+    def _drag_mask(self, p):
+        if self.dragging == "rot":
+            f = (p.x() - ROT_SL.left()) / ROT_SL.width()
+            v = self.settings["mask_rotate"] = round(min(max(f, 0.0), 1.0) * 360) % 360
+            self.show_toast("Rotate %d°" % v, 700)
+        else:
+            f = (p.x() - WID_SL.left()) / WID_SL.width()
+            v = self.settings["mask_width"] = round(10 + min(max(f, 0.0), 1.0) * 170)
+            self.show_toast("Width %d°" % v, 700)
 
     def _base(self):
         """Color the shading/harmony rows are built from."""
@@ -814,7 +1099,8 @@ class LumaPicker(QWidget):
 
     def harmonies(self):
         L, a, b = self._base()
-        return harmony_colors(L, a, b, HARMONIES[self.harmony_index()][1])
+        luma = luma_of_hex(oklab_to_hex(L, a, b)) if self.luma_mode() else None
+        return harmony_colors(L, a, b, HARMONIES[self.harmony_index()][1], luma)
 
     def cycle_harmony(self, step):
         self.settings["harmony"] = (self.harmony_index() + step) % len(HARMONIES)
@@ -831,8 +1117,7 @@ class LumaPicker(QWidget):
         self.update()
 
     def surroundings(self):
-        L, a, b = self._base()
-        return surroundings(self.surface(), oklab_to_hex(L, a, b), self.shades(),
+        return surroundings(self.surface(), self.shades(),
                             float(self.settings.get("hue_shift_strength", 1.0)))
 
     # --------------------------------------------- copy / paste / eyedropper
@@ -871,9 +1156,82 @@ class LumaPicker(QWidget):
         save_settings(self.settings)
         self.update()
 
+    def start_pairing(self):
+        """Connect button: wait for Clip Studio's pairing QR code on screen
+        (File > Connect to smartphone), then connect. Click again to cancel."""
+        if self.pair_timer.isActive():
+            self.pair_timer.stop()
+        else:
+            self.pair_left = 90                   # about one minute
+            self.pair_timer.start()
+        self.update()
+
+    def _look_for_qr(self):
+        self.pair_left -= 1
+        if self.pair_left <= 0:
+            self.pair_timer.stop()
+            self.show_toast("No QR code found", 2500)
+            return
+        for scr in QGuiApplication.screens():
+            qr = decode_qr(find_qr_url(scr.grabWindow(0).toImage()) or "")
+            if qr:
+                self.pair_timer.stop()
+                self.link.pair(qr)
+                return
+
+    def _on_link(self, state):
+        if state == "paired":
+            self.show_toast("Connected! Close the QR window", 3000)
+        elif state.startswith("failed:"):
+            self.show_toast("Clip Studio refused (%s)" % state[7:], 4000)
+        self.update()
+
+    def _paint_link(self, p):
+        """Status row under the header: connected, or a warning with how to fix it."""
+        r = LINK_RECT
+        busy = self.pair_timer.isActive() or bool(self.link.pairing)
+        if self.link.ready:
+            head, sub, col, btn = "Connected to Clip Studio", "Colors go straight in", "#9ee6a8", None
+        elif busy:
+            head, sub, col, btn = ("Looking for the QR code...",
+                                   "Clip Studio: File > Connect to smartphone", BORDER, "Cancel")
+        elif self.link.paired():
+            head, sub, col, btn = ("Not connected to Clip Studio",
+                                   "Start Clip Studio, or click Connect to pair again",
+                                   "#ff8a5c", "Connect")
+        else:
+            head, sub, col, btn = ("Not connected to Clip Studio",
+                                   "Click Connect, then File > Connect to smartphone in CSP",
+                                   "#ff8a5c", "Connect")
+        f = QFont("Segoe UI", 8)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(QColor(col))
+        p.setBrush(QColor(col))
+        p.drawEllipse(QRectF(r.left() + 1, r.top() + 6, 6, 6))
+        p.drawText(QRect(r.left() + 11, r.top(), r.width() - 80, 18),
+                   Qt.AlignVCenter | Qt.AlignLeft, head)
+        f.setBold(False)
+        f.setPointSizeF(7.5)
+        p.setFont(f)
+        p.setPen(QColor(DIM))
+        p.drawText(QRect(r.left() + 11, r.top() + 16, r.width() - 11, 16),
+                   Qt.AlignVCenter | Qt.AlignLeft, sub)
+        if btn:
+            p.setPen(QPen(QColor(col), 1))
+            p.setBrush(QColor(ACTIVE))
+            p.drawRoundedRect(QRectF(LINK_BTN), 8, 8)
+            p.setPen(QColor(TEXT))
+            p.drawText(LINK_BTN, Qt.AlignCenter, btn)
+
     def start_eyedropper(self, target="main"):
         self.sample_target = target
-        self.sampler.start()
+        if getattr(self, "screen_grey", False):
+            # the grab would be grey too: lift the effect for the snapshot only
+            set_screen_grey(False)
+            QTimer.singleShot(60, lambda: (self.sampler.start(), set_screen_grey(True)))
+        else:
+            self.sampler.start()
 
     def _on_sampled(self, hx):
         if self.sample_target == "main":
@@ -904,16 +1262,46 @@ class LumaPicker(QWidget):
 
     # --------------------------------------------------------------- geometry
     def ab_to_point(self, a, b):
-        cx, cy, half = fit_for_L(self.L)
-        x = FIELD.left() + (a - (cx - half)) / (2 * half) * FIELD.width()
-        y = FIELD.top() + ((cy + half) - b) / (2 * half) * FIELD.height()
-        return QPointF(x, y)
+        shape = self.view_shape()
+        if shape in ("focus", "full"):
+            cx, cy, half = plane_view(self.value(), self.luma_mode(), shape)
+            return QPointF(FIELD.left() + (a - cx + half) / (2 * half) * FIELD.width(),
+                           FIELD.top() + (cy + half - b) / (2 * half) * FIELD.height())
+        if self.round_field():
+            h = float(np.degrees(np.arctan2(b, a))) % 360.0
+            cm = float(cmax_at(max_chroma(self.value(), self.luma_mode()), h))
+            r = min(float(np.hypot(a, b)) / max(cm, 1e-6), 1.0) * FIELD.width() / 2
+            hr = np.radians(h)
+            return QPointF(FIELD.center().x() + 0.5 + r * np.cos(hr),
+                           FIELD.center().y() + 0.5 - r * np.sin(hr))
+        h = float(np.degrees(np.arctan2(b, a))) % 360.0
+        cm = float(cmax_at(max_chroma(self.value(), self.luma_mode()), h))
+        fx = ((h - SQUARE_HUE0) % 360.0) / 360.0
+        fy = min(float(np.hypot(a, b)) / max(cm, 1e-6), 1.0)
+        return QPointF(FIELD.left() + fx * FIELD.width(), FIELD.top() + fy * FIELD.height())
 
     def point_to_ab(self, p):
-        cx, cy, half = fit_for_L(self.L)
-        fx = min(max((p.x() - FIELD.left()) / FIELD.width(), 0.0), 1.0)
-        fy = min(max((p.y() - FIELD.top()) / FIELD.height(), 0.0), 1.0)
-        return cx - half + fx * 2 * half, cy + half - fy * 2 * half
+        shape = self.view_shape()
+        if shape in ("focus", "full"):
+            cx, cy, half = plane_view(self.value(), self.luma_mode(), shape)
+            fx = min(max((p.x() - FIELD.left()) / FIELD.width(), 0.0), 1.0)
+            fy = min(max((p.y() - FIELD.top()) / FIELD.height(), 0.0), 1.0)
+            return cx - half + fx * 2 * half, cy + half - fy * 2 * half
+        if self.round_field():
+            rad = FIELD.width() / 2
+            x = (p.x() - FIELD.center().x() - 0.5) / rad
+            y = (FIELD.center().y() + 0.5 - p.y()) / rad
+            h = float(np.degrees(np.arctan2(y, x))) % 360.0
+            C = min(float(np.hypot(x, y)), 1.0) * float(
+                cmax_at(max_chroma(self.value(), self.luma_mode()), h))
+            return C * np.cos(np.radians(h)), C * np.sin(np.radians(h))
+        # the color of the cell under the pen, exactly as drawn
+        k = self.cells()
+        fx = min(max((p.x() - FIELD.left()) / FIELD.width(), 0.0), 0.9999)
+        fy = min(max((p.y() - FIELD.top()) / FIELD.height(), 0.0), 0.9999)
+        h, s = square_hue_share((np.floor(fx * k) + 0.5) / k, (np.floor(fy * k) + 0.5) / k)
+        C = float(s) * float(cmax_at(max_chroma(self.value(), self.luma_mode()), h))
+        return C * np.cos(np.radians(float(h))), C * np.sin(np.radians(float(h)))
 
     # ---------------------------------------------------------------- showing
     @staticmethod
@@ -932,8 +1320,6 @@ class LumaPicker(QWidget):
         self.move(x, y)
 
     def show_at_cursor(self):
-        if IS_WIN:
-            self.target_hwnd = foreground()
         pos = QCursor.pos()
         saved = self._saved_pos() if self.pinned else None
         if saved is not None:
@@ -979,7 +1365,7 @@ class LumaPicker(QWidget):
             self.show_at_cursor()
 
     def _check_auto_hide(self):
-        if (not self.isVisible() or self.pinned or self.applying or self.dragging
+        if (not self.isVisible() or self.pinned or self.dragging
                 or self.move_offset is not None
                 or not self.settings.get("auto_hide", True)):
             return
@@ -989,97 +1375,14 @@ class LumaPicker(QWidget):
 
     # ---------------------------------------------------------------- applying
     def apply_hex(self, hx):
-        mode = self.settings.get("apply_mode", "screen_pick")
-        if mode != "screen_pick" or not IS_WIN:
-            QGuiApplication.clipboard().setText(hx)
-            self._finish_apply(hx)
-            return
-        try:
-            parse_combo(self.settings.get("pick_shortcut", ""))
-        except ValueError as exc:
-            QGuiApplication.clipboard().setText(hx)
-            self.notify("pick_shortcut is not valid (%s). Copied %s instead." % (exc, hx))
-            self._finish_apply(hx)
-            return
-        self.applying = True
-        self._flash_on(hx)
-        QApplication.processEvents()
-        focus(self.target_hwnd)
-        # give Windows a frame or two to actually put the dot on screen
-        QTimer.singleShot(int(self.settings.get("flash_ms", 35)),
-                          lambda: self._step_shortcut(hx))
-
-    def _step_shortcut(self, hx):
-        self._flash_on(hx)
-        # remember CSP's windows, so we can spot its picker window opening
-        self._pid = window_pid(self.target_hwnd)
-        self._before = visible_windows_of(self._pid) if self._pid else set()
-        send_combo(self.settings["pick_shortcut"])
-        self._t0 = QDateTime.currentMSecsSinceEpoch()
-        QTimer.singleShot(15, lambda: self._wait_for_picker(hx))
-
-    def _wait_for_picker(self, hx):
-        """Click as soon as CSP's picker is up, instead of a fixed wait."""
-        waited = QDateTime.currentMSecsSinceEpoch() - self._t0
-        limit = int(self.settings.get("pick_delay_ms", 250))
-        opened = bool(self._pid) and bool(visible_windows_of(self._pid) - self._before)
-        # CSP's picker window shows up after ~65 ms but only takes clicks
-        # a little later, so never click before "picker_ready_ms"
-        ready = int(self.settings.get("picker_ready_ms", 150))
-        if (opened and waited >= ready) or waited >= max(limit, ready + 60):
-            self._log("picker %s, clicked after %d ms" % (
-                "seen" if opened else "NOT seen", waited))
-            self._step_click(hx)
-        else:
-            QTimer.singleShot(10, lambda: self._wait_for_picker(hx))
-
-    def _flash_on(self, hx):
-        """Put the color under the pen for CSP's screen picker to sample:
-        a tiny dot ("dot") or the whole panel ("panel")."""
-        if self.settings.get("flash_mode", "dot") == "panel":
-            self.flash = hx
-            set_topmost(int(self.winId()), True)
-            self.repaint()
-        else:
-            self.dot.show_at_cursor(hx)
-
-    def _log(self, msg):
-        if not self.settings.get("debug_log", False):
-            return
-        try:
-            with open(os.path.join(APP_DIR, "pick_log.txt"), "a", encoding="utf-8") as f:
-                f.write("%s  %s  target=%s\n" % (
-                    QDateTime.currentDateTime().toString("HH:mm:ss.zzz"), msg,
-                    self.target_hwnd))
-        except Exception:
-            pass
-
-    def _step_click(self, hx):
-        self._flash_on(hx)            # follow the pen if it moved meanwhile
-        QApplication.processEvents()
-        click("left")
-        self._log("left-click sent")
-        # CSP needs a moment to take the click before the closing right-click
-        QTimer.singleShot(int(self.settings.get("exit_delay_ms", 90)),
-                          lambda: self._step_exit(hx))
-
-    def _step_exit(self, hx):
-        self._log("right-click at %d ms" % (QDateTime.currentMSecsSinceEpoch() - self._t0))
-        if self.settings.get("right_click_to_exit_pick", True):
-            click("right")
-        after = self.settings.get("after_pick_shortcut", "")
-        if after:
-            QTimer.singleShot(30, lambda: send_combo(after))
-        QTimer.singleShot(40, lambda: self._finish_apply(hx))
+        self.wheel_timer.stop()
+        if not self.link.set_color(hx):
+            self.show_toast("Not connected to Clip Studio", 2500)
+        self._finish_apply(hx)
 
     def _finish_apply(self, hx):
-        self.flash = None
-        self.applying = False
-        self.dot.hide()
-        if IS_WIN and not self.on_top:
-            set_topmost(int(self.winId()), False)
         self.applied_hex = hx
-        if self.settings.get("also_copy_hex") and self.settings.get("apply_mode") == "screen_pick":
+        if self.settings.get("also_copy_hex"):
             QGuiApplication.clipboard().setText(hx)
         if hx in self.history:
             self.history.remove(hx)
@@ -1092,26 +1395,38 @@ class LumaPicker(QWidget):
 
     # ------------------------------------------------------------------ input
     def mousePressEvent(self, e):
-        if self.applying:
-            return
         if e.button() == Qt.RightButton and HEX_RECT.contains(e.position().toPoint()):
             self.paste_hex()
             return
         if e.button() != Qt.LeftButton:
             return
-        if IS_WIN:
-            # the panel never takes focus, so the app in front is the one to paint in
-            fg = foreground()
-            if fg and int(fg) != int(self.winId()):
-                self.target_hwnd = fg
         p = e.position()
         pt = p.toPoint()
-        if FIELD.contains(pt):
+        if ZOOM_BTN.contains(pt) and self.settings.get("field_shape") == "focus":
+            self.toggle_zoom()
+        elif FIELD.contains(pt):
             self.dragging = "field"
             self._drag_field(p)
         elif SLIDER.adjusted(0, -4, 0, 4).contains(pt):
             self.dragging = "slider"
             self._drag_slider(p)
+        elif LINK_BTN.contains(pt) and not self.link.ready:
+            self.start_pairing()
+        elif GREY_BTN.contains(pt):
+            self.toggle_grey_panel()
+        elif SCREEN_BTN.contains(pt):
+            self.toggle_screen_grey()
+        elif SHAPE_SQ.contains(pt) or SHAPE_RD.contains(pt) or SHAPE_FO.contains(pt):
+            self.set_shape("round" if SHAPE_RD.contains(pt) else
+                           "focus" if SHAPE_FO.contains(pt) else "square")
+        elif MASK_PREV.contains(pt):
+            self.cycle_mask(-1)
+        elif MASK_NEXT.contains(pt) or MASK_NAME.contains(pt):
+            self.cycle_mask(1)
+        elif self.mask() and (ROT_SL.adjusted(-6, -4, 6, 4).contains(pt)
+                              or WID_SL.adjusted(-6, -4, 6, 4).contains(pt)):
+            self.dragging = "rot" if ROT_SL.adjusted(-6, -4, 6, 4).contains(pt) else "wid"
+            self._drag_mask(p)
         elif CLOSE_BTN.contains(pt):
             self.hide_popup()
         elif PIN_BTN.contains(pt):
@@ -1122,6 +1437,10 @@ class LumaPicker(QWidget):
             self.set_hex(self.applied_hex)
         elif EYE_BTN.contains(pt):
             self.start_eyedropper("main")
+        elif MODE_BTN.contains(pt):
+            self.toggle_value_mode()
+        elif COPY_BTN.contains(pt):
+            self.copy_hex()
         elif HEX_RECT.contains(pt):
             self.copy_hex()
         elif pt.y() < HEADER_H:
@@ -1165,14 +1484,16 @@ class LumaPicker(QWidget):
                         return
 
     def mouseMoveEvent(self, e):
-        if self.applying:
-            return
         if self.move_offset is not None:
             self.move(e.globalPosition().toPoint() - self.move_offset)
             return
         pt = e.position().toPoint()
         over_btn = any(r.contains(pt) for r in (CLOSE_BTN, PIN_BTN, TOP_BTN, EYE_BTN, HEX_RECT,
-                                               OLD_SW, NEW_SW))
+                                               MODE_BTN, COPY_BTN, OLD_SW, NEW_SW, SHAPE_SQ,
+                                               SHAPE_RD, SHAPE_FO, MASK_PREV, MASK_NAME, MASK_NEXT,
+                                               GREY_BTN, SCREEN_BTN, LINK_BTN))
+        if not (self.dragging or e.buttons()):
+            self._show_tip(pt, e.globalPosition().toPoint())
         want = (Qt.SizeAllCursor if pt.y() < HEADER_H and not over_btn
                 else Qt.PointingHandCursor if over_btn else Qt.ArrowCursor)
         if self.cursor().shape() != want:
@@ -1181,15 +1502,22 @@ class LumaPicker(QWidget):
             self._drag_field(e.position())
         elif self.dragging == "slider":
             self._drag_slider(e.position())
+        elif self.dragging in ("rot", "wid"):
+            self._drag_mask(e.position())
 
     def mouseReleaseEvent(self, e):
-        if self.applying or e.button() != Qt.LeftButton:
+        if e.button() != Qt.LeftButton:
             return
         if self.move_offset is not None:
             self.move_offset = None
             # a window you placed yourself stays there and stays open
             self.settings["window_pos"] = [self.x(), self.y()]
             self.set_pinned(True)
+            return
+        if self.dragging in ("rot", "wid"):
+            self.dragging = None
+            save_settings(self.settings)
+            self.update()
             return
         if self.dragging in ("field", "slider"):
             self.dragging = None
@@ -1210,44 +1538,134 @@ class LumaPicker(QWidget):
     def _drag_field(self, p):
         self.shade_base = None
         a, b = self.point_to_ab(p)
-        a, b = clamp_chroma(self.L, a, b)
+        m = self.mask()
+        C = float(np.hypot(a, b))
+        if m and C >= MASK_GREY_C:      # masked hue: slide to the nearest allowed one
+            h = np.radians(mask_snap(float(np.degrees(np.arctan2(b, a))), *m))
+            a, b = C * np.cos(h), C * np.sin(h)
+        if self.luma_mode():
+            L, a, b = luma_color(self.Y, a, b)
+            self.L = float(L)
+        else:
+            a, b = clamp_chroma(self.L, a, b)
         self.a, self.b = float(a), float(b)
+        if not self.luma_mode():
+            self.Y = luma_of_hex(self.current_hex())   # ready if the mode flips
         self.update()
 
+    def _tips(self):
+        on = lambda v: "on" if v else "off"    # noqa: E731
+        return (
+            (HEX_RECT, "Hex code. Click to copy, right-click to paste one"),
+            (COPY_BTN, "Copy the hex code"),
+            (LINK_BTN, "Connect to Clip Studio: click, then open File > Connect to "
+                       "smartphone in Clip Studio. Luma reads the QR code and pairs"),
+            (MODE_BTN, "How value is measured. L: perceptual. Y: Clip Studio "
+                       "luminance (grey Color-layer check). Click to switch"),
+            (EYE_BTN, "Eyedropper: pick any color on screen (%s)"
+             % self.settings.get("eyedropper_hotkey", "")),
+            (OLD_SW, "Last color sent. Click to go back to it"),
+            (NEW_SW, "Current color"),
+            (TOP_BTN, "Stay in front of other windows (%s)" % on(self.on_top)),
+            (PIN_BTN, "Pin: keep the panel open at this spot (%s). Unpinned, it "
+                      "hides when the pen moves away" % on(self.pinned)),
+            (CLOSE_BTN, "Hide (%s shows it again)" % self.settings.get("hotkey", "")),
+            (SLIDER, "Value. Drag, or use the mouse wheel for 1% steps"),
+            (SHAPE_SQ, "Square field: hue left to right, pale to strong top to bottom"),
+            (SHAPE_RD, "Round wheel: hue around the circle, strongest at the edge"),
+            (SHAPE_FO, "Focus: the plain color plane of this value, grey where no color exists"),
+            (GREY_BTN, "Show this panel in greyscale: the field turns one flat grey "
+                       "because every color in it has the same value"),
+            (SCREEN_BTN, "Whole screen in greyscale (%s): paint in values only. "
+                         "Picked colors stay real colors"
+             % (self.settings.get("greyscale_hotkey", "") or "no hotkey")),
+            (MASK_NAME.united(MASK_PREV).united(MASK_NEXT),
+             "Gamut mask: only some hues can be picked. Click to change"),
+            (ROT_SL, "Turn the mask"),
+            (WID_SL, "How wide each allowed hue sector is"),
+            (JUMP_BTN, "On: picking a shade moves the field to it. Off: the rows stay put"),
+            (SURF_PICK, "Pick the floor or background color from the screen"),
+            (SURF_CUR, "Use the current color as the floor or background"),
+        )
+
+    def _show_tip(self, pt, gpos):
+        tip = next((t for r, t in self._tips() if r.contains(pt)), "")
+        if tip != getattr(self, "_tip", ""):
+            self._tip = tip
+            if tip:
+                QToolTip.showText(gpos, tip, self)
+            else:
+                QToolTip.hideText()
+
+    def leaveEvent(self, _):
+        self._tip = ""
+        QToolTip.hideText()
+
     def _drag_slider(self, p):
-        self.shade_base = None
-        self.L = min(max((p.x() - SLIDER.left()) / SLIDER.width(), 0.0), 1.0)
-        self.update()
+        self.set_value((p.x() - SLIDER.left()) / SLIDER.width())
+
+    def wheelEvent(self, e):
+        """Wheel over the field or bar: nudge the value; the color goes to
+        Clip Studio once the wheel has been still for a moment."""
+        pt = e.position().toPoint()
+        if not (FIELD.contains(pt) or SLIDER.adjusted(0, -4, 0, 4).contains(pt)):
+            return
+        notches = e.angleDelta().y() / 120.0
+        if not notches:
+            return
+        self.set_value(self.value() + notches * float(self.settings.get("wheel_step", 0.01)))
+        self.wheel_timer.start(int(self.settings.get("wheel_send_ms", 350)))
 
     # -------------------------------------------------------------- painting
     def _images(self):
         dpr = self.devicePixelRatioF()
         # half resolution while the lightness bar is being dragged: much
         # cheaper, and the full-quality field comes back on release
-        fast = self.dragging == "slider"
-        fk = (round(self.L, 3 if fast else 4), dpr, fast)
+        fast = self.dragging in ("slider", "rot", "wid") or self.wheel_timer.isActive()
+        luma = self.luma_mode()
+        v = self.value()
+        shape = self.view_shape()
+        mask = self.mask()
+        fk = (round(v, 3 if fast else 4), dpr, fast, luma, LUMA_W, shape, mask, self.cells())
         if fk != self._field_key:
             n = int(FIELD.width() * dpr)
-            img = render_field(self.L, n // 2 if fast else n)
+            n = n // 2 if fast else n
+            img = render_view(v, n, luma, shape, mask, self.cells())
             if fast:
                 img = img.scaled(n, n, Qt.IgnoreAspectRatio, Qt.FastTransformation)
             img.setDevicePixelRatio(dpr)
             self._field_img, self._field_key = img, fk
-        sk = (round(self.a, 4), round(self.b, 4), dpr)
+        sk = (round(self.a, 4), round(self.b, 4), dpr, luma, LUMA_W)
         if sk != self._slider_key:
-            img = render_slider(self.a, self.b, int(SLIDER.width() * dpr),
-                                int(SLIDER.height() * dpr))
+            img = (render_slider_luma if luma else render_slider)(
+                self.a, self.b, int(SLIDER.width() * dpr), int(SLIDER.height() * dpr))
             img.setDevicePixelRatio(dpr)
             self._slider_img, self._slider_key = img, sk
         return self._field_img, self._slider_img
 
     def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        if self.flash:  # solid color the CSP screen picker samples
-            p.fillRect(self.rect(), QColor(self.flash))
+        if not self.settings.get("grey_panel", False):
+            p = QPainter(self)
+            p.setRenderHint(QPainter.Antialiasing)
+            self._paint(p)
             return
+        # greyscale: paint off-screen, then turn every pixel into the grey of
+        # its value (the field becomes one flat grey: proof it's one value)
+        dpr = self.devicePixelRatioF()
+        img = QImage(int(W * dpr), int(H * dpr), QImage.Format_RGBA8888)
+        img.fill(Qt.transparent)
+        img.setDevicePixelRatio(dpr)
+        q = QPainter(img)
+        q.setRenderHint(QPainter.Antialiasing)
+        self._paint(q)
+        q.end()
+        arr = np.frombuffer(img.bits(), np.uint8).reshape(
+            img.height(), img.bytesPerLine() // 4, 4)[:, :img.width()]
+        g = np.round(to_grey(arr[..., :3] / 255.0, self.luma_mode()) * 255)
+        arr[..., :3] = np.clip(g, 0, 255).astype(np.uint8)[..., None]
+        QPainter(self).drawImage(0, 0, img)
 
+    def _paint(self, p):
         panel = QPainterPath()
         panel.addRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 14, 14)
         p.fillPath(panel, QColor(BG))
@@ -1263,24 +1681,33 @@ class LumaPicker(QWidget):
                                 QDateTime.currentMSecsSinceEpoch() < self.toast[1]) else None
         if toast:
             p.setPen(QColor("#9ee6a8"))
-            p.drawText(HEX_RECT, Qt.AlignVCenter | Qt.AlignLeft, toast[0])
+            p.drawText(TOAST_RECT, Qt.AlignVCenter | Qt.AlignLeft, toast[0])
         else:
-            # hex (click to copy, right-click to paste) + lightness
+            # hex (click to copy, right-click to paste) + value mode button
             p.drawText(HEX_RECT, Qt.AlignVCenter | Qt.AlignLeft, cur.upper())
-            font.setBold(False)
-            p.setFont(font)
-            p.setPen(QColor(DIM))
-            p.drawText(HEX_RECT.adjusted(66, 0, 0, 0), Qt.AlignVCenter | Qt.AlignLeft,
-                       "L %d" % round(self.L * 100))
+            luma = self.luma_mode()
+            mr = QRectF(MODE_BTN)
+            p.setPen(QPen(QColor(BORDER if luma else "#3a3a46"), 1))
+            p.setBrush(QColor(ACTIVE) if luma else Qt.NoBrush)
+            p.drawRoundedRect(mr, 9, 9)
+            p.setBrush(Qt.NoBrush)
+            p.setFont(QFont("Segoe UI", 8))
+            p.setPen(QColor(TEXT if luma else DIM))
+            p.drawText(mr, Qt.AlignCenter, ("Y %d" if luma else "L %d")
+                       % round(self.value() * 100))
         font.setBold(False)
         p.setFont(font)
-        # eyedropper icon
-        e_ = QRectF(EYE_BTN)
-        p.setPen(QPen(QColor(TEXT), 1.6, Qt.SolidLine, Qt.RoundCap))
-        p.drawLine(QPointF(e_.left() + 5, e_.bottom() - 5), QPointF(e_.right() - 8, e_.top() + 8))
-        p.setBrush(QColor(TEXT))
-        p.drawEllipse(QPointF(e_.right() - 6.5, e_.top() + 6.5), 3.2, 3.2)
-        p.setBrush(Qt.NoBrush)
+        dpr = self.devicePixelRatioF()
+
+        def draw_icon(rect, name, color, size=14):
+            pm = icon(name, color, size, dpr)
+            if pm:
+                p.drawPixmap(QPointF(rect.center().x() + 0.5 - size / 2,
+                                     rect.center().y() + 0.5 - size / 2), pm)
+        if not toast:
+            draw_icon(COPY_BTN, "copy", DIM, 12)
+        draw_icon(EYE_BTN, "eyedropper", TEXT)
+        self._paint_link(p)
 
         sw = QPainterPath()
         sw.addRoundedRect(QRectF(OLD_SW.united(NEW_SW)), 5, 5)
@@ -1297,17 +1724,18 @@ class LumaPicker(QWidget):
         for btn, active in ((TOP_BTN, self.on_top), (PIN_BTN, self.pinned)):
             if active:
                 p.setPen(Qt.NoPen)
-                p.setBrush(QColor("#2e2a4a"))
+                p.setBrush(QColor(ACTIVE))
                 p.drawRoundedRect(QRectF(btn), 5, 5)
+        # stay on top: an arrow pushing up to a bar ("always in front")
         t = QRectF(TOP_BTN)
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(QColor(TEXT if self.on_top else DIM), 1.4))
-        p.drawRoundedRect(QRectF(t.left() + 4, t.top() + 4, 9, 9), 2, 2)
-        p.setBrush(QColor(BORDER) if self.on_top else QColor(BG))
-        p.drawRoundedRect(QRectF(t.left() + 8, t.top() + 8, 9, 9), 2, 2)
-        p.setPen(QPen(QColor(TEXT if self.pinned else DIM), 1.6))
-        p.setBrush(QColor(BORDER) if self.pinned else Qt.NoBrush)
-        p.drawEllipse(QRectF(PIN_BTN).adjusted(5, 5, -5, -5))
+        p.setPen(QPen(QColor(BORDER if self.on_top else DIM), 1.6, Qt.SolidLine, Qt.RoundCap))
+        cx_ = t.center().x() + 0.5
+        p.drawLine(QPointF(t.left() + 5, t.top() + 5), QPointF(t.right() - 4, t.top() + 5))
+        p.drawLine(QPointF(cx_, t.top() + 8), QPointF(cx_, t.bottom() - 4))
+        p.drawLine(QPointF(cx_ - 3.5, t.top() + 11.5), QPointF(cx_, t.top() + 8))
+        p.drawLine(QPointF(cx_ + 3.5, t.top() + 11.5), QPointF(cx_, t.top() + 8))
+        draw_icon(PIN_BTN, "pin", BORDER if self.pinned else DIM, 17)
         p.setPen(QPen(QColor(DIM), 1.6))
         c = QRectF(CLOSE_BTN).adjusted(6, 6, -6, -6)
         p.drawLine(c.topLeft(), c.bottomRight())
@@ -1321,7 +1749,19 @@ class LumaPicker(QWidget):
         p.setClipPath(fpath)
         p.drawImage(FIELD, field_img)
         p.restore()
+        if self.round_field():          # smooth the wheel's pixel edge
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(BG), 2.2))
+            p.drawEllipse(QRectF(FIELD).adjusted(-0.5, -0.5, 0.5, 0.5))
 
+        if self.settings.get("field_shape") == "focus":      # Focus / Full switch
+            zoom = self.settings.get("focus_zoom", True)
+            p.setPen(QPen(QColor(BORDER if zoom else "#3a3a46"), 1))
+            p.setBrush(QColor(BG))
+            p.drawRoundedRect(QRectF(ZOOM_BTN), 9, 9)
+            p.setFont(QFont("Segoe UI", 8))
+            p.setPen(QColor(TEXT))
+            p.drawText(QRectF(ZOOM_BTN), Qt.AlignCenter, "Focus" if zoom else "Full")
         ea, eb = self.effective_ab()
         pt = self.ab_to_point(ea, eb)
         p.setBrush(Qt.NoBrush)
@@ -1336,13 +1776,88 @@ class LumaPicker(QWidget):
         p.setClipPath(spath)
         p.drawImage(SLIDER, slider_img)
         p.restore()
-        hx = SLIDER.left() + self.L * SLIDER.width()
+        hx = SLIDER.left() + self.value() * SLIDER.width()
         handle = QRectF(hx - 6, SLIDER.top() - 3, 12, SLIDER.height() + 6)
         p.setPen(QPen(QColor("#000000a0"), 3.2))
         p.drawRoundedRect(handle, 4, 4)
         p.setPen(QPen(QColor("#ffffff"), 1.6))
         p.setBrush(QColor(cur))
         p.drawRoundedRect(handle, 4, 4)
+
+        # ---- field shape switch + gamut mask
+        small8 = QFont("Segoe UI", 8)
+        p.setFont(small8)
+        sh = self.settings.get("field_shape", "square")
+        seg = QPainterPath()
+        seg.addRoundedRect(QRectF(SHAPE_SQ.united(SHAPE_FO)), 9, 9)
+        p.setPen(QPen(QColor("#3a3a46"), 1))
+        p.setBrush(Qt.NoBrush)
+        p.drawPath(seg)
+        p.save()
+        p.setClipPath(seg)
+        p.fillRect({"round": SHAPE_RD, "focus": SHAPE_FO}.get(sh, SHAPE_SQ), QColor(ACTIVE))
+        p.restore()
+        for rect, label, on in ((SHAPE_SQ, "Square", sh not in ("round", "focus")),
+                                (SHAPE_RD, "Round", sh == "round"),
+                                (SHAPE_FO, "Focus", sh == "focus")):
+            p.setPen(QColor(TEXT if on else DIM))
+            p.drawText(QRectF(rect), Qt.AlignCenter, label)
+
+        # greyscale buttons: half-filled circle (panel), half-filled monitor (screen)
+        for rect, on in ((GREY_BTN, self.settings.get("grey_panel", False)),
+                         (SCREEN_BTN, getattr(self, "screen_grey", False))):
+            r = QRectF(rect)
+            if on:
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(ACTIVE))
+                p.drawRoundedRect(r, 5, 5)
+            col = QColor(BORDER if on else DIM)
+            if rect is GREY_BTN:
+                shape = QRectF(r.center().x() - 5.5, r.center().y() - 5.5, 12, 12)
+            else:
+                shape = QRectF(r.left() + 3, r.top() + 3, 13, 9)
+                p.setPen(QPen(col, 1.4))
+                p.drawLine(QPointF(r.center().x() + 0.5, shape.bottom()),
+                           QPointF(r.center().x() + 0.5, r.bottom() - 3))
+                p.drawLine(QPointF(r.center().x() - 3, r.bottom() - 3),
+                           QPointF(r.center().x() + 4, r.bottom() - 3))
+            half = QPainterPath()
+            if rect is GREY_BTN:
+                half.addEllipse(shape)
+            else:
+                half.addRoundedRect(shape, 1.5, 1.5)
+            p.save()
+            p.setClipRect(QRectF(shape.left(), shape.top(), shape.width() / 2, shape.height()))
+            p.fillPath(half, col)
+            p.restore()
+            p.setPen(QPen(col, 1.4))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(half)
+
+        mask = self.mask()
+        p.setPen(QColor(DIM))
+        p.drawText(QRectF(MASK_PREV), Qt.AlignCenter, "‹")
+        p.drawText(QRectF(MASK_NEXT), Qt.AlignCenter, "›")
+        p.setPen(QColor(TEXT if mask else DIM))
+        p.drawText(QRectF(MASK_NAME), Qt.AlignCenter, MASKS[self.mask_index()][0])
+
+        rot = float(self.settings.get("mask_rotate", 0) or 0) % 360.0
+        wid = min(max(float(self.settings.get("mask_width", 60) or 60), 10.0), 180.0)
+        for rect, label, f in ((ROT_SL, "Rotate", rot / 360.0),
+                               (WID_SL, "Width", (wid - 10) / 170.0)):
+            p.setPen(QColor(DIM if not mask else TEXT))
+            p.drawText(QRect(rect.left() - 42, rect.top() - 2, 40, 18),
+                       Qt.AlignVCenter | Qt.AlignLeft, label)
+            y = rect.center().y() + 0.5
+            p.setPen(QPen(QColor("#3a3a46"), 3, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+            x = rect.left() + f * rect.width()
+            if mask:
+                p.setPen(QPen(QColor(BORDER), 3, Qt.SolidLine, Qt.RoundCap))
+                p.drawLine(QPointF(rect.left(), y), QPointF(x, y))
+            p.setPen(QPen(QColor("#000000a0"), 1))
+            p.setBrush(QColor(TEXT if mask else DIM))
+            p.drawEllipse(QPointF(x, y), 5, 5)
 
         for i in range(HIST_N):
             r = QRectF(hist_rect(i))
@@ -1379,7 +1894,7 @@ class LumaPicker(QWidget):
         jump = bool(self.settings.get("jump_to_picked", True))
         jr = QRectF(JUMP_BTN)
         p.setPen(QPen(QColor(BORDER if jump else "#3a3a46"), 1))
-        p.setBrush(QColor("#2e2a4a") if jump else Qt.NoBrush)
+        p.setBrush(QColor(ACTIVE) if jump else Qt.NoBrush)
         p.drawRoundedRect(jr, 9, 9)
         p.setFont(small)
         p.setPen(QColor(TEXT if jump else DIM))
@@ -1541,8 +2056,9 @@ def main():
             with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
                 fresh = json.load(f)
             for k, v in fresh.items():
-                if k not in ("history", "last_color", "window_pos"):
+                if k not in ("history", "last_color", "window_pos", "csp_link"):
                     settings[k] = v
+            apply_luma_weights(settings)
             picker.update()
         except Exception:
             pass
@@ -1558,8 +2074,11 @@ def main():
     menu.addAction("Show palette", picker.show_centered)
     menu.addAction("Open settings file", lambda: os.startfile(SETTINGS_PATH)
                    if IS_WIN else None)
+    menu.addAction("Screen in greyscale on/off", picker.toggle_screen_grey)
     menu.addSeparator()
     menu.addAction("Quit", app.quit)
+    app.aboutToQuit.connect(lambda: set_screen_grey(False)
+                            if getattr(picker, "screen_grey", False) else None)
     tray.setContextMenu(menu)
     tray.activated.connect(lambda r: picker.show_centered()
                            if r == QSystemTrayIcon.Trigger else None)
@@ -1567,14 +2086,17 @@ def main():
 
     if IS_WIN:
         hk = HotkeyWindow()
-        hk.triggered.connect(lambda i: picker.toggle() if i == 1
-                             else picker.start_eyedropper("main"))
-        try:
-            eh = settings.get("eyedropper_hotkey", "")
-            if eh and not hk.register(eh, 2):
-                notify("Could not register eyedropper key %s." % eh)
-        except ValueError as exc:
-            notify("eyedropper_hotkey is not valid: %s" % exc)
+        actions = {1: picker.toggle, 2: lambda: picker.start_eyedropper("main"),
+                   3: picker.toggle_screen_grey}
+        hk.triggered.connect(lambda i: actions.get(i, lambda: None)())
+        for key, hk_id, what in (("eyedropper_hotkey", 2, "eyedropper"),
+                                 ("greyscale_hotkey", 3, "greyscale")):
+            try:
+                eh = settings.get(key, "")
+                if eh and not hk.register(eh, hk_id):
+                    notify("Could not register %s key %s." % (what, eh))
+            except ValueError as exc:
+                notify("%s is not valid: %s" % (key, exc))
         try:
             if hk.register(settings["hotkey"]):
                 notify("Running. Press %s to open the palette." % settings["hotkey"])
