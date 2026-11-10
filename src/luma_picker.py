@@ -543,6 +543,28 @@ def render_view(value, n, luma=False, shape="square", mask=None, cells=24):
     ok = in_gamut(r, g, b)
     rgb = linear_to_srgb(np.stack([r, g, b], axis=-1))
     rgb[~ok] = grey
+    if shape in ("focus", "full"):
+        # out of gamut: a grey a step off the picked value, so the gamut edge
+        # still shows when the panel or the screen is in greyscale. Not for
+        # round/square: there only stray rim pixels (interpolated L) are out.
+        rgb[~ok] = grey * 0.75 if value >= 0.5 else grey + (1 - grey) * 0.3
+    else:
+        # round/square have no real out-of-gamut area: a stray rim pixel is
+        # out only through interpolated L or the approximate rim, so solve it
+        # exactly and pull its chroma in until it fits (no grey pixels)
+        s = ~ok & inside
+        if s.any():
+            if luma:
+                Ls, As, Bs = luma_color(value, A[s], B[s])
+            else:
+                lo, hi = np.zeros(int(s.sum())), np.ones(int(s.sum()))
+                for _ in range(16):
+                    mid = (lo + hi) / 2
+                    m = in_gamut(*oklab_to_linear(value, A[s] * mid, B[s] * mid))
+                    lo, hi = np.where(m, mid, lo), np.where(m, hi, mid)
+                Ls, As, Bs = value, A[s] * lo, B[s] * lo
+            rgb[s] = linear_to_srgb(np.stack(oklab_to_linear(Ls, As, Bs), axis=-1))
+            ok = ok | s
     if mask and mask[0]:
         hue = np.degrees(np.arctan2(B, A)) % 360.0
         off = ok & ~mask_allows(hue, *mask)
@@ -598,6 +620,23 @@ def render_slider_luma(a, b, w, h):
     Ys = (np.arange(w) + 0.5) / w
     L, aa, bb = luma_color(Ys, np.full(w, a), np.full(w, b))
     rgb = linear_to_srgb(np.stack(oklab_to_linear(L, aa, bb), axis=-1))
+    return _to_qimage(np.repeat(rgb[None, :, :], h, axis=0))
+
+
+def render_hue_sat(value, luma, hue, sat, which, w, h):
+    """Hue bar (every hue at this saturation) or saturation bar (grey to the
+    strongest color of this hue), all at one value."""
+    t = (np.arange(w) + 0.5) / w
+    hs = t * 360.0 if which == "hue" else np.full(w, hue)
+    ss = np.full(w, sat) if which == "hue" else t
+    C = ss * cmax_at(max_chroma(value, luma), hs)
+    a, b = C * np.cos(np.radians(hs)), C * np.sin(np.radians(hs))
+    if luma:
+        L, a, b = luma_color(value, a, b)
+    else:
+        L = np.full(w, value)
+        a, b = clamp_chroma(L, a, b)
+    rgb = linear_to_srgb(np.stack(oklab_to_linear(L, a, b), axis=-1))
     return _to_qimage(np.repeat(rgb[None, :, :], h, axis=0))
 
 
@@ -689,8 +728,10 @@ LINK_RECT = QRect(PAD, 44, W - 2 * PAD, 32)     # Clip Studio connection status
 LINK_BTN = QRect(W - PAD - 64, 45, 64, 16)
 FIELD = QRect(PAD, LINK_RECT.bottom() + 5, W - 2 * PAD, W - 2 * PAD)
 ZOOM_BTN = QRect(FIELD.right() - 50, FIELD.top() + 6, 44, 18)   # Focus/Full (focus view)
-SLIDER = QRect(PAD, FIELD.bottom() + 11, W - 2 * PAD, 24)
-VIEW_Y = SLIDER.bottom() + 10                     # Square|Round  ·  mask
+SLIDER = QRect(PAD, FIELD.bottom() + 11, W - 2 * PAD, 16)    # value
+HUE_SL = QRect(PAD, SLIDER.bottom() + 7, W - 2 * PAD, 16)     # hue
+SAT_SL = QRect(PAD, HUE_SL.bottom() + 7, W - 2 * PAD, 16)     # saturation
+VIEW_Y = SAT_SL.bottom() + 10                    # Square|Round  ·  mask
 SHAPE_SQ = QRect(PAD, VIEW_Y, 37, 18)
 SHAPE_RD = QRect(SHAPE_SQ.right() + 1, VIEW_Y, 37, 18)
 SHAPE_FO = QRect(SHAPE_RD.right() + 1, VIEW_Y, 37, 18)
@@ -1040,7 +1081,16 @@ class LumaPicker(QWidget):
             self.show_toast("Screen greyscale not available")
             return
         self.screen_grey = on
-        self.show_toast("Screen in greyscale" if on else "Screen in color")
+        # the screen filter is a linear matrix: it can only show luminance,
+        # so switch to luminance while it is on, and back after
+        if on and not self.luma_mode():
+            self.toggle_value_mode()
+            self.grey_switched = True
+        elif not on and getattr(self, "grey_switched", False):
+            self.grey_switched = False
+            if self.luma_mode():
+                self.toggle_value_mode()
+        self.show_toast("Screen in greyscale (luminance)" if on else "Screen in color")
 
     def set_shape(self, shape):
         self.settings["field_shape"] = shape
@@ -1407,9 +1457,15 @@ class LumaPicker(QWidget):
         elif FIELD.contains(pt):
             self.dragging = "field"
             self._drag_field(p)
-        elif SLIDER.adjusted(0, -4, 0, 4).contains(pt):
+        elif SLIDER.adjusted(0, -3, 0, 3).contains(pt):
             self.dragging = "slider"
             self._drag_slider(p)
+        elif HUE_SL.adjusted(0, -3, 0, 3).contains(pt):
+            self.dragging = "hue"
+            self._drag_hue_sat(p, "hue")
+        elif SAT_SL.adjusted(0, -3, 0, 3).contains(pt):
+            self.dragging = "sat"
+            self._drag_hue_sat(p, "sat")
         elif LINK_BTN.contains(pt) and not self.link.ready:
             self.start_pairing()
         elif GREY_BTN.contains(pt):
@@ -1502,6 +1558,8 @@ class LumaPicker(QWidget):
             self._drag_field(e.position())
         elif self.dragging == "slider":
             self._drag_slider(e.position())
+        elif self.dragging in ("hue", "sat"):
+            self._drag_hue_sat(e.position(), self.dragging)
         elif self.dragging in ("rot", "wid"):
             self._drag_mask(e.position())
 
@@ -1519,7 +1577,7 @@ class LumaPicker(QWidget):
             save_settings(self.settings)
             self.update()
             return
-        if self.dragging in ("field", "slider"):
+        if self.dragging in ("field", "slider", "hue", "sat"):
             self.dragging = None
             self.apply_hex(self.current_hex())
             return
@@ -1536,8 +1594,31 @@ class LumaPicker(QWidget):
                 self.pick_suggestion(hx)
 
     def _drag_field(self, p):
+        self.set_ab(*self.point_to_ab(p))
+
+    def hue_sat(self):
+        """Hue (degrees) and saturation (share of the max chroma at this hue
+        and value) of the current color. A grey keeps the last hue."""
+        C = float(np.hypot(self.a, self.b))
+        if C > 1e-4:
+            self.hue_keep = float(np.degrees(np.arctan2(self.b, self.a))) % 360.0
+        h = getattr(self, "hue_keep", 0.0)
+        cm = float(cmax_at(max_chroma(self.value(), self.luma_mode()), h))
+        return h, min(C / max(cm, 1e-6), 1.0)
+
+    def set_hue_sat(self, h, s):
+        self.hue_keep = h % 360.0
+        C = min(max(s, 0.0), 1.0) * float(
+            cmax_at(max_chroma(self.value(), self.luma_mode()), h))
+        self.set_ab(C * np.cos(np.radians(h)), C * np.sin(np.radians(h)))
+
+    def _drag_hue_sat(self, p, which):
+        f = min(max((p.x() - HUE_SL.left()) / HUE_SL.width(), 0.0), 1.0)
+        h, s = self.hue_sat()
+        self.set_hue_sat(f * 360.0, s) if which == "hue" else self.set_hue_sat(h, f)
+
+    def set_ab(self, a, b):
         self.shade_base = None
-        a, b = self.point_to_ab(p)
         m = self.mask()
         C = float(np.hypot(a, b))
         if m and C >= MASK_GREY_C:      # masked hue: slide to the nearest allowed one
@@ -1571,6 +1652,9 @@ class LumaPicker(QWidget):
                       "hides when the pen moves away" % on(self.pinned)),
             (CLOSE_BTN, "Hide (%s shows it again)" % self.settings.get("hotkey", "")),
             (SLIDER, "Value. Drag, or use the mouse wheel for 1% steps"),
+            (HUE_SL, "Hue at this value and saturation. Mouse wheel: 1 degree steps"),
+            (SAT_SL, "Saturation: grey to the strongest color this value allows. "
+                     "Mouse wheel: 1% steps"),
             (SHAPE_SQ, "Square field: hue left to right, pale to strong top to bottom"),
             (SHAPE_RD, "Round wheel: hue around the circle, strongest at the edge"),
             (SHAPE_FO, "Focus: the plain color plane of this value, grey where no color exists"),
@@ -1608,11 +1692,19 @@ class LumaPicker(QWidget):
         """Wheel over the field or bar: nudge the value; the color goes to
         Clip Studio once the wheel has been still for a moment."""
         pt = e.position().toPoint()
-        if not (FIELD.contains(pt) or SLIDER.adjusted(0, -4, 0, 4).contains(pt)):
-            return
         notches = e.angleDelta().y() / 120.0
+        on_hue, on_sat = HUE_SL.contains(pt), SAT_SL.contains(pt)
+        if notches and (on_hue or on_sat):
+            h, s = self.hue_sat()
+            self.set_hue_sat(h + notches, s) if on_hue else self.set_hue_sat(h, s + notches / 100)
+            self.wheel_value = False     # the field keeps full quality
+            self.wheel_timer.start(int(self.settings.get("wheel_send_ms", 350)))
+            return
+        if not (FIELD.contains(pt) or SLIDER.adjusted(0, -3, 0, 3).contains(pt)):
+            return
         if not notches:
             return
+        self.wheel_value = True
         self.set_value(self.value() + notches * float(self.settings.get("wheel_step", 0.01)))
         self.wheel_timer.start(int(self.settings.get("wheel_send_ms", 350)))
 
@@ -1621,7 +1713,8 @@ class LumaPicker(QWidget):
         dpr = self.devicePixelRatioF()
         # half resolution while the lightness bar is being dragged: much
         # cheaper, and the full-quality field comes back on release
-        fast = self.dragging in ("slider", "rot", "wid") or self.wheel_timer.isActive()
+        fast = (self.dragging in ("slider", "rot", "wid")
+                or (self.wheel_timer.isActive() and getattr(self, "wheel_value", True)))
         luma = self.luma_mode()
         v = self.value()
         shape = self.view_shape()
@@ -1641,6 +1734,15 @@ class LumaPicker(QWidget):
                 self.a, self.b, int(SLIDER.width() * dpr), int(SLIDER.height() * dpr))
             img.setDevicePixelRatio(dpr)
             self._slider_img, self._slider_key = img, sk
+        h, s = self.hue_sat()
+        hk = (round(v, 3), luma, LUMA_W, dpr, round(h, 1), round(s, 3))
+        if hk != getattr(self, "_hs_key", None):
+            bw, bh = int(HUE_SL.width() * dpr), int(HUE_SL.height() * dpr)
+            self._hs_imgs = [render_hue_sat(v, luma, h, s, which, bw, bh)
+                             for which in ("hue", "sat")]
+            for img in self._hs_imgs:
+                img.setDevicePixelRatio(dpr)
+            self._hs_key = hk
         return self._field_img, self._slider_img
 
     def paintEvent(self, _):
@@ -1770,19 +1872,23 @@ class LumaPicker(QWidget):
         p.setPen(QPen(QColor("#ffffff"), 1.6))
         p.drawEllipse(pt, 7, 7)
 
-        spath = QPainterPath()
-        spath.addRoundedRect(QRectF(SLIDER), 7, 7)
-        p.save()
-        p.setClipPath(spath)
-        p.drawImage(SLIDER, slider_img)
-        p.restore()
-        hx = SLIDER.left() + self.value() * SLIDER.width()
-        handle = QRectF(hx - 6, SLIDER.top() - 3, 12, SLIDER.height() + 6)
-        p.setPen(QPen(QColor("#000000a0"), 3.2))
-        p.drawRoundedRect(handle, 4, 4)
-        p.setPen(QPen(QColor("#ffffff"), 1.6))
-        p.setBrush(QColor(cur))
-        p.drawRoundedRect(handle, 4, 4)
+        h, s = self.hue_sat()
+        for rect, img, f in ((SLIDER, slider_img, self.value()),
+                             (HUE_SL, self._hs_imgs[0], h / 360.0),
+                             (SAT_SL, self._hs_imgs[1], s)):
+            spath = QPainterPath()
+            spath.addRoundedRect(QRectF(rect), 6, 6)
+            p.save()
+            p.setClipPath(spath)
+            p.drawImage(rect, img)
+            p.restore()
+            hx = rect.left() + f * rect.width()
+            handle = QRectF(hx - 6, rect.top() - 3, 12, rect.height() + 6)
+            p.setPen(QPen(QColor("#000000a0"), 3.2))
+            p.drawRoundedRect(handle, 4, 4)
+            p.setPen(QPen(QColor("#ffffff"), 1.6))
+            p.setBrush(QColor(cur))
+            p.drawRoundedRect(handle, 4, 4)
 
         # ---- field shape switch + gamut mask
         small8 = QFont("Segoe UI", 8)
