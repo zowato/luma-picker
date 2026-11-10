@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0
 
 - **Focus view**: the color plane of one value (the original field) is back as a third option next to Square and Round, with a Focus/Full switch to zoom in on the colors or show the whole plane
 - **Direct connection to Clip Studio**: click Connect in the panel, then File > Connect to smartphone in Clip Studio. Colors go straight in. The panel warns when it isn't connected

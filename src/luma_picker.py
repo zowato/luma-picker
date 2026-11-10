@@ -13,7 +13,7 @@ Clip Studio Paint directly, over CSP's companion connection (csp_link.py).
 
 https://github.com/zowato/luma-picker  -  MIT License
 """
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import colorsys
 import ctypes
