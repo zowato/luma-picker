@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **Hue and Saturation sliders** under the value bar, all three the same height. Both keep the value locked
+- Screen greyscale switches to luminance value mode while it is on, so the screen and the panel show the same greys
+- Focus view: the area outside the colors is a grey a step off the picked value, so the edge shows in greyscale
+- Round and Square: no more grey pixels at the rim of the wheel at dark values
+
 ## 1.1.0
 
 - **Focus view**: the color plane of one value (the original field) is back as a third option next to Square and Round, with a Focus/Full switch to zoom in on the colors or show the whole plane
