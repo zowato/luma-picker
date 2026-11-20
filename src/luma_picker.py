@@ -65,6 +65,7 @@ DEFAULTS = {
     "window_pos": None,
     "last_color": "#c0607a",
     "history": [],
+    "csp_colors": [],              # colors picked in Clip Studio
 }
 
 
@@ -707,7 +708,8 @@ HIST_Y = MASK_SL_Y + 14 + 12
 HIST_N = 8
 HIST_GAP = 6
 HIST_SIZE = (FIELD.width() - HIST_GAP * (HIST_N - 1)) // HIST_N
-SHADE_LABEL_Y = HIST_Y + HIST_SIZE + 12          # "Shading" caption line
+CSP_Y = HIST_Y + HIST_SIZE + 6                    # colors picked in Clip Studio
+SHADE_LABEL_Y = CSP_Y + HIST_SIZE + 12           # "Shading" caption line
 SHADE_GAP = 5
 SHADE_SIZE = (FIELD.width() - SHADE_GAP * (SHADE_N - 1)) // SHADE_N
 SHADE_ROW_H = 26
@@ -793,8 +795,8 @@ def icon(name, color, size, dpr=1.0):
     return _icon_cache[key]
 
 
-def hist_rect(i):
-    return QRect(PAD + i * (HIST_SIZE + HIST_GAP), HIST_Y, HIST_SIZE, HIST_SIZE)
+def hist_rect(i, y=HIST_Y):
+    return QRect(PAD + i * (HIST_SIZE + HIST_GAP), y, HIST_SIZE, HIST_SIZE)
 
 
 class _SamplerScreen(QWidget):
@@ -894,6 +896,7 @@ class LumaPicker(QWidget):
         self.wheel_timer = QTimer(self, singleShot=True,
                                   timeout=lambda: self.apply_hex(self.current_hex()))
         self.history = [h for h in settings.get("history", []) if isinstance(h, str)][:HIST_N]
+        self.csp_colors = [h for h in settings.get("csp_colors", []) if isinstance(h, str)][:HIST_N]
         self.dragging = None
         self.pinned = bool(settings.get("pinned", False))
         self.move_offset = None
@@ -908,6 +911,7 @@ class LumaPicker(QWidget):
         self.link = CspLink(settings.setdefault("csp_link", {}),
                             lambda: save_settings(self.settings))
         self.link.state.connect(self._on_link)
+        self.link.color.connect(self._on_csp_color)
         self.pair_timer = QTimer(self, interval=700, timeout=self._look_for_qr)
         self.link.connect_saved()
         self.sample_target = "surface"
@@ -1186,6 +1190,18 @@ class LumaPicker(QWidget):
             self.show_toast("Clip Studio refused (%s)" % state[7:], 4000)
         self.update()
 
+    def _on_csp_color(self, hx):
+        """A color picked in Clip Studio goes to its own row. The wheel stays."""
+        if hx == self.applied_hex:      # Luma sent it: already in Recent
+            return
+        if hx in self.csp_colors:
+            self.csp_colors.remove(hx)
+        self.csp_colors.insert(0, hx)
+        del self.csp_colors[HIST_N:]
+        self.settings["csp_colors"] = self.csp_colors
+        save_settings(self.settings)
+        self.update()
+
     def _paint_link(self, p):
         """Status row under the header: connected, or a warning with how to fix it."""
         r = LINK_RECT
@@ -1447,10 +1463,11 @@ class LumaPicker(QWidget):
             g = e.globalPosition().toPoint()
             self.move_offset = g - self.pos()
         else:
-            for i, hx in enumerate(self.history):
-                if hist_rect(i).contains(pt):
-                    self.pending = ("history", hx)   # sent on pen-up
-                    return
+            for y, row in ((HIST_Y, self.history), (CSP_Y, self.csp_colors)):
+                for i, hx in enumerate(row):
+                    if hist_rect(i, y).contains(pt):
+                        self.pending = ("history", hx)   # sent on pen-up
+                        return
             if JUMP_BTN.contains(pt):
                 self.set_jump(not self.settings.get("jump_to_picked", True))
                 return
@@ -1586,6 +1603,9 @@ class LumaPicker(QWidget):
             (JUMP_BTN, "On: picking a shade moves the field to it. Off: the rows stay put"),
             (SURF_PICK, "Pick the floor or background color from the screen"),
             (SURF_CUR, "Use the current color as the floor or background"),
+            (QRect(PAD, HIST_Y, FIELD.width(), HIST_SIZE), "Recent colors. Click to use one"),
+            (QRect(PAD, CSP_Y, FIELD.width(), HIST_SIZE),
+             "Colors picked in Clip Studio. Click to use one"),
         )
 
     def _show_tip(self, pt, gpos):
@@ -1859,15 +1879,16 @@ class LumaPicker(QWidget):
             p.setBrush(QColor(TEXT if mask else DIM))
             p.drawEllipse(QPointF(x, y), 5, 5)
 
-        for i in range(HIST_N):
-            r = QRectF(hist_rect(i))
-            if i < len(self.history):
-                p.setPen(QPen(QColor("#00000080"), 1))
-                p.setBrush(QColor(self.history[i]))
-            else:
-                p.setPen(QPen(QColor("#34343e"), 1))
-                p.setBrush(Qt.NoBrush)
-            p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 5, 5)
+        for y, row in ((HIST_Y, self.history), (CSP_Y, self.csp_colors)):
+            for i in range(HIST_N):
+                r = QRectF(hist_rect(i, y))
+                if i < len(row):
+                    p.setPen(QPen(QColor("#00000080"), 1))
+                    p.setBrush(QColor(row[i]))
+                else:
+                    p.setPen(QPen(QColor("#34343e"), 1))
+                    p.setBrush(Qt.NoBrush)
+                p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), 5, 5)
 
         # ---- shading suggestions
         def caption(y, text):
@@ -2056,7 +2077,7 @@ def main():
             with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
                 fresh = json.load(f)
             for k, v in fresh.items():
-                if k not in ("history", "last_color", "window_pos", "csp_link"):
+                if k not in ("history", "csp_colors", "last_color", "window_pos", "csp_link"):
                     settings[k] = v
             apply_luma_weights(settings)
             picker.update()
