@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Clip Studio colors**: a second swatch row under Recent colors collects the colors you pick in Clip Studio. Click one to load it into Luma. The wheel does not move by itself
+
 ## 1.1.0
 
 - **Focus view**: the color plane of one value (the original field) is back as a third option next to Square and Round, with a Focus/Full switch to zoom in on the colors or show the whole plane

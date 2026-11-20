@@ -215,6 +215,15 @@ def test_auth_detail_xors_secrets():
     assert bytes.fromhex(d[1]) == bytes([ord("a") ^ 0xB6, ord("b") ^ 0xD5])
 
 
+def test_color_of_reads_32_bit_rgb():
+    d = {"CurrentColorRed": 18 * 0x01010101, "CurrentColorGreen": 52 * 0x01010101,
+         "CurrentColorBlue": 86 * 0x01010101, "IsCurrentColorTransparent": False}
+    assert cl.color_of(d) == "#123456"
+    assert cl.color_of(dict(d, IsCurrentColorTransparent=True)) is None
+    assert cl.color_of({"CurrentColorRed": 1}) is None
+    assert cl.color_of(None) is None
+
+
 @pytest.mark.parametrize("shape", ["focus", "full"])
 @pytest.mark.parametrize("luma", [False, True])
 def test_focus_plane_is_one_value(shape, luma):
