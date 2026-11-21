@@ -3,6 +3,10 @@
 ## Unreleased
 
 - **Clip Studio colors**: a second swatch row under Recent colors collects the colors you pick in Clip Studio. Click one to load it into Luma. The wheel does not move by itself
+- **Hue and Saturation sliders** under the value bar, all three the same height. Both keep the value locked
+- Screen greyscale switches to luminance value mode while it is on, so the screen and the panel show the same greys
+- Focus view: the area outside the colors is a grey a step off the picked value, so the edge shows in greyscale
+- Round and Square: no more grey pixels at the rim of the wheel at dark values
 
 ## 1.1.0
 
