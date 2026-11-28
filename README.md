@@ -1,16 +1,16 @@
 # Luma Picker
 
-A floating color palette for digital painting on Windows, built around
+A color palette for digital painting on Windows, built around
 **value**. Every color in the big field has the *same perceptual lightness*,
-so you can change hue and saturation freely without breaking your values. It
-also suggests shading colors, color harmonies and the shadow and bounce light
+so you can change hue and saturation freely without breaking your values. 
+It also suggests shading colors, color harmonies and the shadow and bounce light
 of an object's surroundings. Colors go straight into **Clip Studio Paint**.
 
 ![Luma Picker panel](docs/panel.png)
 
 ## Features
 
-- **Lightness-locked color field.** Pick any hue or saturation at one fixed
+- **Value-locked color field.** Pick any hue or saturation at one fixed
   value. The bar below changes the lightness. The grey around the colors is the
   neutral grey of the same value.
 - **Two ways to measure value.** `L` (perceptual, OKLab) is the default. Click
