@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.2.0
 
 - **Clip Studio colors**: a second swatch row under Recent colors collects the colors you pick in Clip Studio. Click one to load it into Luma. The wheel does not move by itself
 
