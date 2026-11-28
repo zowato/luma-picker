@@ -53,6 +53,9 @@ of an object's surroundings. Colors go straight into **Clip Studio Paint**.
   pop up under your pen with a hotkey. It works well on a macro pad
   (Razer Tartarus, Stream Deck, …).
 - **Recent colors**, and settings that reload while the app runs.
+- **Clip Studio colors.** A second row under Recent colors collects the colors
+  you pick in Clip Studio (wheel, color set, eyedropper). Click one to bring it
+  into Luma. A drag on Clip Studio's wheel adds only the color where you stop.
 
 ## Download and install
 
@@ -91,7 +94,7 @@ connected, the panel shows a warning and picks don't reach Clip Studio.
 | **Focus / Full** (corner of the Focus view) | Zoom the plane to this value's colors, or show the whole plane |
 | **‹ mask ›**, Rotate, Width | Pick a gamut mask, turn it and set how wide each sector is |
 | Click **L / Y** next to the hex | Switch between perceptual and Clip Studio luminance value |
-| Click a recent, shading or harmony swatch | Send that color |
+| Click a recent, Clip Studio, shading or harmony swatch | Send that color |
 | **Jump on/off** (Shading) | On: the wheel moves to the shade you picked. Off: the rows stay put |
 | **‹ name ›** (Harmony) | Switch the harmony scheme |
 | **Pick / Current** (Surroundings) | Set the surface color from the screen or from the current color |

@@ -64,6 +64,19 @@ def auth_detail(generation, first_secret, password):
     return [generation, h(first_secret), h(password)]
 
 
+def color_of(detail):
+    """SyncSubViewUIState reply -> "#rrggbb" of Clip Studio's active color, or
+    None (transparent or unreadable). RGB come on a 32-bit scale."""
+    if not isinstance(detail, dict) or detail.get("IsCurrentColorTransparent"):
+        return None
+    try:
+        rgb = [min(max(int(detail["CurrentColor" + c]) // 0x01010101, 0), 255)
+               for c in ("Red", "Green", "Blue")]
+    except (KeyError, TypeError, ValueError):
+        return None
+    return "#%02x%02x%02x" % tuple(rgb)
+
+
 def find_qr_url(qimage):
     """Look for Clip Studio's pairing QR in a screenshot."""
     try:
@@ -81,8 +94,10 @@ def find_qr_url(qimage):
 
 
 class CspLink(QObject):
-    """Keeps one companion connection to Clip Studio and sets its color."""
+    """Keeps one companion connection to Clip Studio, sets its color and
+    reads it back. Clip Studio pushes nothing, so the color is polled."""
     state = Signal(str)          # "ready", "paired", "failed:<why>", "down"
+    color = Signal(str)          # Clip Studio's color, once it holds still
 
     def __init__(self, cfg, save):
         super().__init__()
@@ -95,6 +110,11 @@ class CspLink(QObject):
         self.buf, self.serial, self.ready, self.pairing = b"", 0, False, None
         self.beat = QTimer(self, interval=1000, timeout=lambda: self._send("TellHeartbeat", ""))
         self.retry = QTimer(self, interval=3000, singleShot=True, timeout=self.connect_saved)
+        self.poll = QTimer(self, interval=200, timeout=lambda: self._send("SyncSubViewUIState", ""))
+        # a drag on Clip Studio's wheel gives many colors: report only where it stops
+        self.seen = None
+        self.settle = QTimer(self, interval=600, singleShot=True,
+                             timeout=lambda: self.color.emit(self.seen))
 
     # ------------------------------------------------------------- public
     def paired(self):
@@ -145,6 +165,14 @@ class CspLink(QObject):
                 self._handle(*parse_frame(raw))
 
     def _handle(self, kind, command, serial, detail):
+        if command == "SyncSubViewUIState":
+            hx = color_of(detail)
+            if not hx:                  # transparent: nothing held still
+                self.settle.stop()
+            elif hx != self.seen:
+                if self.seen:           # the first read after connect is no pick
+                    self.settle.start()
+                self.seen = hx
         if kind == 1:                       # Clip Studio asks: just acknowledge
             self._send(command, "", kind=6, serial=serial)
             return
@@ -160,6 +188,7 @@ class CspLink(QObject):
                 self.state.emit("paired")
             self.ready = True
             self.beat.start()
+            self.poll.start()
             self.state.emit("ready")
         else:
             if why == "PasswordMismatch" and not self.pairing:
@@ -173,6 +202,9 @@ class CspLink(QObject):
         was = self.ready
         self.ready = False
         self.beat.stop()
+        self.poll.stop()
+        self.settle.stop()
+        self.seen = None
         if was:
             self.state.emit("down")
         if self.paired() and not self.retry.isActive():
